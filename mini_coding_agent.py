@@ -4,6 +4,7 @@ import re
 import shutil
 import subprocess
 import sys
+import unicodedata
 import urllib.error
 import urllib.request
 import uuid
@@ -12,7 +13,7 @@ from pathlib import Path
 
 
 DOC_NAMES = ("AGENTS.md", "README.md", "pyproject.toml", "package.json")
-HELP_TEXT = "/help, /memory, /session, /reset, /exit"
+HELP_TEXT = "/help, /memory, /session, /reset, /skill, /exit"
 WELCOME_ART = (
     "/\\     /\\\\",
     "{  `---'  }",
@@ -28,11 +29,14 @@ HELP_DETAILS = "\n".join(
         "/memory  Show the agent's distilled working memory.",
         "/session Show the path to the saved session file.",
         "/reset   Clear the current session history and memory.",
+        "/skill   Run a prompt with a skill: /skill <name> <prompt>. Bare /skill lists skills.",
         "/exit    Exit the agent.",
     ]
 )
-MAX_TOOL_OUTPUT = 4000
+MAX_TOOL_OUTPUT = 16000
 MAX_HISTORY = 12000
+RECENT_TOOL_OUTPUT = 3000
+OUTPUT_CHUNK_SIZE = 2800
 IGNORED_PATH_NAMES = {".git", ".mini-coding-agent", "__pycache__", ".pytest_cache", ".ruff_cache", ".venv", "venv"}
 
 ##############################
@@ -58,6 +62,20 @@ def clip(text, limit=MAX_TOOL_OUTPUT):
     return text[:limit] + f"\n...[truncated {len(text) - limit} chars]"
 
 
+def retain_tool_output(text):
+    if len(text) <= MAX_TOOL_OUTPUT:
+        return text
+    return text[:MAX_TOOL_OUTPUT] + f"\n[discarded {len(text) - MAX_TOOL_OUTPUT} characters beyond the retention limit; unavailable for retrieval]"
+
+
+def safe_terminal_text(text):
+    return "".join(
+        char if char in "\n\t" or not unicodedata.category(char).startswith("C")
+        else f"\\u{ord(char):04x}"
+        for char in text
+    )
+
+
 def middle(text, limit):
     text = str(text).replace("\n", " ")
     if len(text) <= limit:
@@ -67,6 +85,101 @@ def middle(text, limit):
     left = (limit - 3) // 2
     right = limit - 3 - left
     return text[:left] + "..." + text[-right:]
+
+
+SKILL_NAME_RE = re.compile(r"^[a-z0-9-]+$")
+SKILL_SIZE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*b\b", re.IGNORECASE)
+
+
+def parse_frontmatter(text):
+    lines = text.splitlines(keepends=True)
+    if not lines or lines[0].strip() != "---":
+        raise ValueError("missing frontmatter")
+    end = None
+    for index in range(1, len(lines)):
+        if lines[index].strip() == "---":
+            end = index
+            break
+    if end is None:
+        raise ValueError("unterminated frontmatter")
+    meta = {}
+    for line in lines[1:end]:
+        if not line.strip() or line[0] in " \t" or ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        meta[key.strip()] = value.strip()
+    return meta, "".join(lines[end + 1:])
+
+
+def load_skill(path, root):
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ValueError(f"unreadable: {exc}") from exc
+    meta, body = parse_frontmatter(text)
+    name = meta.get("name", "")
+    description = meta.get("description", "")
+    if not name:
+        raise ValueError("missing name")
+    if not description:
+        raise ValueError("missing description")
+    if name[0] in "|>" or description[0] in "|>":
+        raise ValueError("block scalar not supported")
+    if not SKILL_NAME_RE.match(name):
+        raise ValueError("invalid name")
+    return {
+        "name": name,
+        "description": description,
+        "path": path.resolve(),
+        "rel": path.relative_to(root).as_posix(),
+        "body": body,
+    }
+
+
+def discover_skills(root):
+    root = Path(root)
+    skills_dir = root / "skills"
+    if not skills_dir.is_dir():
+        return [], []
+    skills, warnings, seen = [], [], set()
+    for folder in sorted((item for item in skills_dir.iterdir() if item.is_dir()), key=lambda item: item.name):
+        path = folder / "SKILL.md"
+        if not path.is_file():
+            continue
+        label = f"warning: skipped skills/{folder.name}/SKILL.md: "
+        try:
+            skill = load_skill(path, root)
+        except ValueError as exc:
+            warnings.append(label + str(exc))
+            continue
+        if skill["name"] in seen:
+            warnings.append(label + f"duplicate skill name '{skill['name']}'")
+            continue
+        seen.add(skill["name"])
+        skills.append(skill)
+    return skills, warnings
+
+
+def skill_cap_for_model(model_name, override=None):
+    if override is not None:
+        return override
+    size = None
+    if model_name:
+        name = str(model_name)
+        for candidate in (name.rsplit(":", 1)[-1], name):
+            match = SKILL_SIZE_RE.search(candidate)
+            if match:
+                size = float(match.group(1))
+                break
+    if size is None or size > 13:
+        return 24000
+    return 4000 if size <= 4 else 12000
+
+
+def truncate_skill(body, cap):
+    if len(body) <= cap:
+        return body
+    return body[:cap] + f"\n[skill truncated at {cap} chars]"
 
 
 ##############################
@@ -216,6 +329,12 @@ class OllamaModelClient:
                 f"Host: {self.host}\n"
                 f"Model: {self.model}"
             ) from exc
+        except TimeoutError as exc:
+            raise RuntimeError(f"Ollama request timed out after {self.timeout} seconds: {exc}") from exc
+        except OSError as exc:
+            raise RuntimeError(f"Ollama request failed: {exc}") from exc
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Ollama returned invalid JSON: {exc}") from exc
 
         if data.get("error"):
             raise RuntimeError(f"Ollama error: {data['error']}")
@@ -235,6 +354,10 @@ class MiniAgent:
         depth=0,
         max_depth=1,
         read_only=False,
+        skills=None,
+        skill_max_chars=None,
+        model_name=None,
+        show_command_output=False,
     ):
         self.model_client = model_client
         self.workspace = workspace
@@ -246,6 +369,18 @@ class MiniAgent:
         self.depth = depth
         self.max_depth = max_depth
         self.read_only = read_only
+        self.show_command_output = show_command_output
+        self.skill_cap = skill_cap_for_model(model_name, skill_max_chars)
+        discovered = skills is None
+        if discovered:
+            skills, warnings = discover_skills(self.root)
+            for warning in warnings:
+                print(warning, file=sys.stderr)
+        self.skills = skills
+        self.active_skills = {}
+        self.current_request = ""
+        self._skill_read = None
+        resumed = session is not None
         self.session = session or {
             "id": datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6],
             "created_at": now(),
@@ -253,6 +388,19 @@ class MiniAgent:
             "history": [],
             "memory": {"task": "", "files": [], "notes": []},
         }
+        used = self.session.get("skills_used")
+        self.session["skills_used"] = used if isinstance(used, list) else []
+        for item in self.session["history"]:
+            if item["role"] == "tool" and "result_id" not in item:
+                item["result_id"] = uuid.uuid4().hex
+        if resumed and discovered:
+            known = {skill["name"] for skill in self.skills}
+            warned = set()
+            for entry in self.session["skills_used"]:
+                missing = entry.get("name") if isinstance(entry, dict) else None
+                if missing and missing not in known and missing not in warned:
+                    warned.add(missing)
+                    print(f"warning: session used skill '{missing}' which is no longer on disk", file=sys.stderr)
         self.tools = self.build_tools()
         self.prefix = self.build_prefix()
         self.session_path = self.session_store.save(self.session)
@@ -292,6 +440,12 @@ class MiniAgent:
                 "risky": False,
                 "description": "Read a UTF-8 file by line range.",
                 "run": self.tool_read_file,
+            },
+            "read_tool_output": {
+                "schema": {"id": "str", "start": "int", "end": "int"},
+                "risky": False,
+                "description": "Retrieve a retained tool result by ID and zero-based, end-exclusive character range (max 2800 characters).",
+                "run": self.tool_read_tool_output,
             },
             "search": {
                 "schema": {"pattern": "str", "path": "str='.'"},
@@ -365,24 +519,42 @@ class MiniAgent:
             "- Do not repeat the same tool call with the same arguments if it did not help. Choose a different tool or return a final answer.",
             "- Required tool arguments must not be empty. Do not call read_file, write_file, patch_file, run_shell, or delegate with args={}.",
         ])
-        return "\n\n".join([
+        sections = [
             "You are Mini-Coding-Agent, a small local coding agent running through Ollama.",
             "Rules:\n" + rules,
             "Tools:\n" + tool_text,
             "Valid response examples:\n" + examples,
-            self.workspace.text(),
-        ])
+        ]
+        if self.skills:
+            skill_lines = "\n".join(f"- {s['name']}: {s['description']} ({s['rel']})" for s in self.skills)
+            sections.append(
+                "Available skills:\n" + skill_lines + "\n"
+                "Skill rules:\n"
+                "- When the task matches a skill's description, read its SKILL.md with read_file first, then follow it.\n"
+                "- Skill instructions apply only to the current request; read the skill again if needed later."
+            )
+        sections.append(self.workspace.text())
+        return "\n\n".join(sections)
 
     def memory_text(self):
         memory = self.session["memory"]
         notes = "\n".join(f"- {note}" for note in memory["notes"]) or "- none"
-        return "\n".join([
+        lines = [
             "Memory:",
             f"- task: {memory['task'] or '-'}",
             f"- files: {', '.join(memory['files']) or '-'}",
             "- notes:",
             notes,
-        ])
+        ]
+        used = []
+        for entry in self.session["skills_used"]:
+            name = entry.get("name") if isinstance(entry, dict) else None
+            if name and name not in used:
+                used.append(name)
+        if used or self.active_skills:
+            lines.append(f"- skills_used: {', '.join(used) or '-'}")
+            lines.append(f"- skills_active: {', '.join(self.active_skills) or '-'}")
+        return "\n".join(lines)
 
     #####################################################
     #### 4) Context Reduction And Output Management #####
@@ -392,45 +564,77 @@ class MiniAgent:
         if not history:
             return "- empty"
 
-        lines = []
+        entries = []
         seen_reads = set()
         recent_start = max(0, len(history) - 6)
-        for index, item in enumerate(history):
-            recent = index >= recent_start
+        skipped_reads = set()
+        for index in range(len(history) - 1, -1, -1):
+            item = history[index]
             if item["role"] == "tool" and item["name"] in ("write_file", "patch_file"):
-                path = str(item["args"].get("path", ""))
-                seen_reads.discard(path)
-            if item["role"] == "tool" and item["name"] == "read_file" and not recent:
+                seen_reads.discard(str(item["args"].get("path", "")))
+            if item["role"] == "tool" and item["name"] == "read_file" and index < recent_start:
                 path = str(item["args"].get("path", ""))
                 if path in seen_reads:
-                    continue
+                    skipped_reads.add(index)
                 seen_reads.add(path)
+        for index, item in enumerate(history):
+            recent = index >= recent_start
+            if index in skipped_reads:
+                continue
 
             if item["role"] == "tool":
-                limit = 900 if recent else 180
-                lines.append(f"[tool:{item['name']}] {json.dumps(item['args'], sort_keys=True)}")
-                lines.append(clip(item["content"], limit))
+                limit = RECENT_TOOL_OUTPUT if recent else 180
+                args = clip(json.dumps(item["args"], sort_keys=True), 1000)
+                result_id = item.get("result_id", "")
+                content = item["content"]
+                entry = f"[tool:{item['name']} id:{result_id}] {args}\n{clip(content, limit)}"
+                if "original_length" in item and len(content) > limit:
+                    discarded = item["original_length"] - item["retained_length"]
+                    entry += f"\n[discarded {discarded} characters beyond the retention limit; unavailable for retrieval]"
+                if len(content) > limit:
+                    entry += f"\n[Use read_tool_output with id {result_id} to retrieve retained content.]"
+                entries.append(entry)
             else:
                 limit = 900 if recent else 220
-                lines.append(f"[{item['role']}] {clip(item['content'], limit)}")
+                entries.append(f"[{item['role']}] {clip(item['content'], limit)}")
 
-        return clip("\n".join(lines), MAX_HISTORY)
+        marker = "[... earlier transcript entries omitted]"
+        selected = []
+        size = len(marker) + 1
+        for entry in reversed(entries):
+            extra = len(entry) + (1 if selected else 0)
+            if size + extra > MAX_HISTORY:
+                break
+            selected.append(entry)
+            size += extra
+        selected.reverse()
+        if len(selected) < len(entries):
+            selected.insert(0, marker)
+        return "\n".join(selected)
 
     ########################################################
     #### 2) Prompt Shape And Cache Reuse (Continued) #######
     ########################################################
     def prompt(self, user_message):
-        return "\n\n".join([
-            self.prefix,
-            self.memory_text(),
-            "Transcript:\n" + self.history_text(),
-            "Current user request:\n" + user_message,
-        ])
+        sections = [self.prefix, self.memory_text()]
+        if self.active_skills:
+            sections.append("The delegate tool is unavailable while skills are active; perform the work using the other tools.")
+            sections.append(
+                "Skill note: the skills below are already loaded. Follow them now; "
+                "do not read their SKILL.md again."
+            )
+            bodies = "\n\n".join(f"### {name}\n{body}" for name, body in self.active_skills.items())
+            sections.append("Active skills:\n" + bodies)
+        sections.append("Transcript:\n" + self.history_text())
+        sections.append("Current user request:\n" + user_message)
+        return "\n\n".join(sections)
 
     ###############################################
     #### 5) Session Memory (Continued) ###########
     ###############################################
     def record(self, item):
+        if item["role"] == "tool" and "result_id" not in item:
+            item["result_id"] = uuid.uuid4().hex
         self.session["history"].append(item)
         self.session_path = self.session_store.save(self.session)
 
@@ -442,19 +646,51 @@ class MiniAgent:
         note = f"{name}: {clip(str(result).replace(chr(10), ' '), 220)}"
         self.remember(memory["notes"], note, 5)
 
-    def ask(self, user_message):
+    def ask(self, user_message, forced_skill=None):
+        self.current_request = user_message
         memory = self.session["memory"]
         if not memory["task"]:
             memory["task"] = clip(user_message.strip(), 300)
         self.record({"role": "user", "content": user_message, "created_at": now()})
 
+        try:
+            if forced_skill is not None:
+                self.activate_skill(forced_skill, forced_skill["body"])
+            return self._ask_loop(user_message)
+        finally:
+            self.active_skills = {}
+
+    def activate_skill(self, skill, body):
+        capped = truncate_skill(body, self.skill_cap)
+        self.active_skills[skill["name"]] = capped
+        request = clip(self.current_request, 300)
+        for entry in self.session["skills_used"]:
+            if isinstance(entry, dict) and entry.get("name") == skill["name"] and entry.get("request") == request:
+                break
+        else:
+            self.session["skills_used"].append({"name": skill["name"], "request": request, "at": now()})
+        return capped
+
+    def skill_for_path(self, resolved):
+        for skill in self.skills:
+            if skill["path"] == resolved:
+                return skill
+        return None
+
+    def _ask_loop(self, user_message):
+        memory = self.session["memory"]
         tool_steps = 0
         attempts = 0
         max_attempts = max(self.max_steps * 3, self.max_steps + 4)
 
+        failure_reason = None
         while tool_steps < self.max_steps and attempts < max_attempts:
             attempts += 1
-            raw = self.model_client.complete(self.prompt(user_message), self.max_new_tokens)
+            try:
+                raw = self.model_client.complete(self.prompt(user_message), self.max_new_tokens)
+            except RuntimeError as exc:
+                failure_reason = f"model request failed: {exc}"
+                break
             kind, payload = self.parse(raw)
 
             if kind == "tool":
@@ -462,15 +698,21 @@ class MiniAgent:
                 name = payload.get("name", "")
                 args = payload.get("args", {})
                 result = self.run_tool(name, args)
-                self.record(
-                    {
-                        "role": "tool",
-                        "name": name,
-                        "args": args,
-                        "content": result,
-                        "created_at": now(),
-                    }
-                )
+                if self._skill_read is not None:
+                    skill = self._skill_read
+                    self._skill_read = None
+                    result = f"[skill loaded: {skill['name']} - {skill['description']}]"
+                event = {
+                    "role": "tool",
+                    "name": name,
+                    "args": args,
+                    "content": result,
+                    "created_at": now(),
+                }
+                if self._result_original_length is not None and self._result_original_length > MAX_TOOL_OUTPUT:
+                    event["retained_length"] = MAX_TOOL_OUTPUT
+                    event["original_length"] = self._result_original_length
+                self.record(event)
                 self.note_tool(name, args, result)
                 continue
 
@@ -483,20 +725,48 @@ class MiniAgent:
             self.remember(memory["notes"], clip(final, 220), 5)
             return final
 
-        if attempts >= max_attempts and tool_steps < self.max_steps:
-            final = "Stopped after too many malformed model responses without a valid tool call or final answer."
+        if failure_reason is None:
+            if attempts >= max_attempts and tool_steps < self.max_steps:
+                failure_reason = "too many malformed model responses"
+            else:
+                failure_reason = "tool-call step limit reached"
+        final_prompt = (
+            self.prompt(user_message)
+            + f"\n\nFinal-answer turn: {failure_reason}. No tools are available. "
+            "Return a <final> answer based on available results, or report what could not be completed."
+        )
+        try:
+            raw = self.model_client.complete(final_prompt, self.max_new_tokens)
+        except RuntimeError as exc:
+            final = f"Final-answer turn failed after {failure_reason}: {exc}"
         else:
-            final = "Stopped after reaching the step limit without a final answer."
+            kind, payload = self.parse(raw)
+            if kind == "final":
+                final = payload.strip()
+            elif kind == "tool":
+                final = f"Final-answer turn failed after {failure_reason}: model requested a tool; no tool was executed."
+            else:
+                final = f"Final-answer turn failed after {failure_reason}: model returned a malformed or empty answer."
         self.record({"role": "assistant", "content": final, "created_at": now()})
+        self.remember(memory["notes"], clip(final, 220), 5)
         return final
 
     #############################################################
     #### 3) Structured Tools, Validation, And Permissions #######
     #############################################################
     def run_tool(self, name, args):
+        self._skill_read = None
+        self._result_original_length = None
+
+        def finish(result):
+            self._result_original_length = len(result)
+            return retain_tool_output(result)
+
         tool = self.tools.get(name)
         if tool is None:
-            return f"error: unknown tool '{name}'"
+            return finish(f"error: unknown tool '{name}'")
+        if name == "delegate" and self.active_skills:
+            return finish("error: delegate is unavailable while skills are active")
         try:
             self.validate_tool(name, args)
         except Exception as exc:
@@ -504,15 +774,18 @@ class MiniAgent:
             message = f"error: invalid arguments for {name}: {exc}"
             if example:
                 message += f"\nexample: {example}"
-            return message
+            return finish(message)
         if self.repeated_tool_call(name, args):
-            return f"error: repeated identical tool call for {name}; choose a different tool or return a final answer"
+            return finish(f"error: repeated identical tool call for {name}; choose a different tool or return a final answer")
         if tool["risky"] and not self.approve(name, args):
-            return f"error: approval denied for {name}"
+            return finish(f"error: approval denied for {name}")
         try:
-            return clip(tool["run"](args))
+            result = tool["run"](args)
         except Exception as exc:
-            return f"error: tool {name} failed: {exc}"
+            return finish(f"error: tool {name} failed: {exc}")
+        if self._skill_read is not None:
+            return result
+        return finish(result)
 
     def repeated_tool_call(self, name, args):
         tool_events = [item for item in self.session["history"] if item["role"] == "tool"]
@@ -525,6 +798,7 @@ class MiniAgent:
         examples = {
             "list_files": '<tool>{"name":"list_files","args":{"path":"."}}</tool>',
             "read_file": '<tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":80}}</tool>',
+            "read_tool_output": '<tool>{"name":"read_tool_output","args":{"id":"RESULT_ID","start":0,"end":1000}}</tool>',
             "search": '<tool>{"name":"search","args":{"pattern":"binary_search","path":"."}}</tool>',
             "run_shell": '<tool>{"name":"run_shell","args":{"command":"uv run --with pytest python -m pytest -q","timeout":20}}</tool>',
             "write_file": '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>',
@@ -546,10 +820,23 @@ class MiniAgent:
             path = self.path(args["path"])
             if not path.is_file():
                 raise ValueError("path is not a file")
+            if self.skill_for_path(path) is not None:
+                return  # skill files are read whole; line ranges are ignored
             start = int(args.get("start", 1))
             end = int(args.get("end", 200))
             if start < 1 or end < start:
                 raise ValueError("invalid line range")
+            return
+
+        if name == "read_tool_output":
+            result_id = args.get("id")
+            if not isinstance(result_id, str) or not result_id:
+                raise ValueError("id must be a non-empty string")
+            start, end = args.get("start"), args.get("end")
+            if type(start) is not int or type(end) is not int or start < 0 or end <= start:
+                raise ValueError("invalid character range")
+            if end - start > OUTPUT_CHUNK_SIZE:
+                raise ValueError(f"range exceeds {OUTPUT_CHUNK_SIZE} characters")
             return
 
         if name == "search":
@@ -717,7 +1004,24 @@ class MiniAgent:
     def reset(self):
         self.session["history"] = []
         self.session["memory"] = {"task": "", "files": [], "notes": []}
+        self.session["skills_used"] = []
+        self.active_skills = {}
+        self.skills, warnings = discover_skills(self.root)
+        for warning in warnings:
+            print(warning, file=sys.stderr)
+        self.prefix = self.build_prefix()
         self.session_store.save(self.session)
+
+    def parse_skill_command(self, text):
+        parts = text.split(None, 2)
+        if len(parts) == 1:
+            return "list", None
+        skill = next((s for s in self.skills if s["name"] == parts[1]), None)
+        if skill is None:
+            return "unknown", parts[1]
+        if len(parts) < 3:
+            return "usage", None
+        return "run", (skill, parts[2].strip())
 
     def path_is_within_root(self, resolved):
         probe = resolved
@@ -757,6 +1061,12 @@ class MiniAgent:
         path = self.path(args["path"])
         if not path.is_file():
             raise ValueError("path is not a file")
+        skill = self.skill_for_path(path)
+        if skill is not None:
+            _, body = parse_frontmatter(path.read_text(encoding="utf-8", errors="replace"))
+            capped = self.activate_skill(skill, body)
+            self._skill_read = skill
+            return capped
         start = int(args.get("start", 1))
         end = int(args.get("end", 200))
         if start < 1 or end < start:
@@ -764,6 +1074,19 @@ class MiniAgent:
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
         body = "\n".join(f"{number:>4}: {line}" for number, line in enumerate(lines[start - 1:end], start=start))
         return f"# {path.relative_to(self.root)}\n{body}"
+
+    def tool_read_tool_output(self, args):
+        for item in self.session["history"]:
+            if item["role"] == "tool" and item.get("result_id") == args["id"]:
+                content = item["content"][:item.get("retained_length", len(item["content"]))]
+                start, end = args["start"], args["end"]
+                if end > len(content):
+                    raise ValueError(f"range exceeds retained content length {len(content)}; unavailable or discarded")
+                header = f"result {args['id']} characters {start}-{end} of {len(content)}"
+                if "original_length" in item:
+                    header += f" (discarded {item['original_length'] - item['retained_length']} characters)"
+                return f"{header}:\n{content[start:end]}"
+        raise ValueError("tool result ID not found in current session")
 
     def tool_search(self, args):
         pattern = str(args.get("pattern", "")).strip()
@@ -800,23 +1123,36 @@ class MiniAgent:
         timeout = int(args.get("timeout", 20))
         if timeout < 1 or timeout > 120:
             raise ValueError("timeout must be in [1, 120]")
-        result = subprocess.run(
-            command,
-            cwd=self.root,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-        return "\n".join(
-            [
-                f"exit_code: {result.returncode}",
-                "stdout:",
-                result.stdout.strip() or "(empty)",
-                "stderr:",
-                result.stderr.strip() or "(empty)",
-            ]
-        )
+        try:
+            result = subprocess.run(
+                command,
+                cwd=self.root,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            status = f"exit_code: {result.returncode}"
+            stdout, stderr = result.stdout, result.stderr
+        except subprocess.TimeoutExpired as exc:
+            status = f"error: command timed out after {timeout} seconds"
+            stdout, stderr = exc.stdout, exc.stderr
+        except OSError as exc:
+            status = f"error: command could not start: {exc}"
+            stdout, stderr = None, None
+
+        def output_text(value):
+            if isinstance(value, bytes):
+                value = value.decode("utf-8", errors="replace")
+            return (value or "").strip() or "(empty)"
+
+        stdout, stderr = output_text(stdout), output_text(stderr)
+        output = f"{status}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        if len(output) > MAX_TOOL_OUTPUT:
+            output = f"{status}\nstderr:\n{stderr}\nstdout:\n{stdout}"
+        if self.show_command_output:
+            print(safe_terminal_text(f"[command: {command}]\n{retain_tool_output(output)}\n[end command output]"))
+        return output
 
     def tool_write_file(self, args):
         path = self.path(args["path"])
@@ -860,6 +1196,8 @@ class MiniAgent:
             depth=self.depth + 1,
             max_depth=self.max_depth,
             read_only=True,
+            skills=self.skills,
+            skill_max_chars=self.skill_cap,
         )
         child.session["memory"]["task"] = task
         child.session["memory"]["notes"] = [clip(self.history_text(), 300)]
@@ -931,6 +1269,9 @@ def build_agent(args):
             approval_policy=args.approval,
             max_steps=args.max_steps,
             max_new_tokens=args.max_new_tokens,
+            model_name=args.model,
+            skill_max_chars=args.skill_max_chars,
+            show_command_output=args.show_command_output,
         )
     return MiniAgent(
         model_client=model,
@@ -939,7 +1280,17 @@ def build_agent(args):
         approval_policy=args.approval,
         max_steps=args.max_steps,
         max_new_tokens=args.max_new_tokens,
+        model_name=args.model,
+        skill_max_chars=args.skill_max_chars,
+        show_command_output=args.show_command_output,
     )
+
+
+def positive_int(value):
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
 
 
 def build_arg_parser():
@@ -961,9 +1312,35 @@ def build_arg_parser():
     )
     parser.add_argument("--max-steps", type=int, default=6, help="Maximum tool/model iterations per request.")
     parser.add_argument("--max-new-tokens", type=int, default=512, help="Maximum model output tokens per step.")
+    parser.add_argument("--show-command-output", action="store_true", help="Display executed command output; may reveal sensitive data.")
     parser.add_argument("--temperature", type=float, default=0.2, help="Sampling temperature sent to Ollama.")
     parser.add_argument("--top-p", type=float, default=0.9, help="Top-p sampling value sent to Ollama.")
+    parser.add_argument(
+        "--skill-max-chars",
+        type=positive_int,
+        default=None,
+        help="Max characters of a skill body given to the model (default depends on model size: 4000/12000/24000).",
+    )
     return parser
+
+
+def is_skill_command(text):
+    return text == "/skill" or text.startswith("/skill ")
+
+
+def run_skill_command(agent, text):
+    kind, value = agent.parse_skill_command(text)
+    if kind == "list":
+        print("\n".join(f"{s['name']}: {s['description']}" for s in agent.skills) or "no skills found")
+    elif kind == "usage":
+        print("usage: /skill <name> <prompt>")
+    elif kind == "unknown":
+        available = ", ".join(s["name"] for s in agent.skills) or "none"
+        print(f"unknown skill '{value}'. available: {available}")
+    else:
+        skill, prompt = value
+        print()
+        print(agent.ask(prompt, forced_skill=skill))
 
 
 def main(argv=None):
@@ -977,7 +1354,10 @@ def main(argv=None):
         if prompt:
             print()
             try:
-                print(agent.ask(prompt))
+                if is_skill_command(prompt):
+                    run_skill_command(agent, prompt)
+                else:
+                    print(agent.ask(prompt))
             except RuntimeError as exc:
                 print(str(exc), file=sys.stderr)
                 return 1
@@ -1010,7 +1390,10 @@ def main(argv=None):
 
         print()
         try:
-            print(agent.ask(user_input))
+            if is_skill_command(user_input):
+                run_skill_command(agent, user_input)
+            else:
+                print(agent.ask(user_input))
         except RuntimeError as exc:
             print(str(exc), file=sys.stderr)
 
