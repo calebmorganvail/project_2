@@ -338,6 +338,18 @@ Paths below are relative to the repository root. Earlier steps describe the exis
 | REQ-052 | Selection frequency and tool budget | Plan 15.1, 15.5-15.6 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
 | REQ-053 | Focused tests and real-model evaluation | Plan 15.6, 15.8 | `tests/test_mini_coding_agent.py`, evaluation results |
 
+## Step 16: Similarity check, skill log and context window (REQ-054-051)
+- Add `skill_tokens` and `skill_similarity` (module level, stdlib).
+- `MiniAgent.match_skill` runs at the start of `ask` (inside the existing `try/finally`) before `select_skills`, logs the `match` entry, and a selected skill is loaded through the same validated staging as the selection pass and activated with trigger `similarity`; `select_skills` runs only when nothing matched, and its result is logged as `model_select`. `activate_skill` logs `executed` once per skill per request; the `finally` logs `finished` before clearing active skills.
+- `MiniAgent.log_skill_event` appends to `.mini-coding-agent/skills.jsonl`; the CLI turns on the stderr echo.
+- `OllamaModelClient` sends `num_ctx`; new flags `--num-ctx` and `--skill-threshold`.
+- `train-and-report` description starts with "Solve Lab 4:" so that prompt passes the threshold.
+- Tests: tokenizer and bounds, repo skill matches Lab 4 prompts, similarity activation + log contents, no-match logging, model and explicit triggers, single `executed` on re-read, threshold off, no log without skills, echo off by default, `num_ctx` payload, similarity match skips the selection call, no match falls back to model selection, failed selection is logged.
+
+| REQ | Covered by |
+|---|---|
+| REQ-054-051 | Step 15 |
+
 ## Done criteria
 - Every testable behavior requirement has at least one passing test; verify documentation by inspection and selection quality manually (C6).
 - Existing tests for unchanged behavior pass; changed tests match the revised no-skill, output, and final-answer requirements.

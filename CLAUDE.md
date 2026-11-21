@@ -18,7 +18,7 @@ uv run pytest -q                          # or: python -m pytest -q   (agent tes
 cd lab4 && python -m pytest               # Lab 4 tests
 uv run ruff check .
 ```
-CLI flags: `--cwd --model --host --ollama-timeout --resume --approval {ask,auto,never} --max-steps(6) --max-new-tokens(512) --temperature(0.2) --top-p(0.9) --skill-max-chars --show-command-output`.
+CLI flags: `--cwd --model --host --ollama-timeout --resume --approval {ask,auto,never} --max-steps(6) --max-new-tokens(512) --temperature(0.2) --top-p(0.9) --skill-max-chars --skill-threshold(0.25) --num-ctx(8192) --show-command-output`.
 REPL commands: `/help /memory /session /reset /exit /quit /skill [<name> <prompt>]`.
 
 ## Layout
@@ -48,7 +48,9 @@ Sessions/logs live in `.mini-coding-agent/` (gitignored): `sessions/`, `skills.j
 - Prompt = stable prefix (+ skills list) + memory + transcript; tool results retain up to 16,000 characters, and recent transcript results have a 3,000-character allowance.
 - Skills: discovered from `<root>/skills/*/SKILL.md` only. Ordinary requests with skills get a separate bounded model selection pass; selected files are validated and loaded before the normal loop. `/skill` forces a skill without selection, and an empty catalog skips selection. A model may still load a skill with `read_file`. Bodies live in `active_skills` for that request only and are cleared in `ask`'s `finally`; they never enter `history`, `memory`, or session JSON (only load notices and `skills_used`).
 - An unknown tool name matching a skill yields its `read_file` example without consuming a tool step; the response-attempt limit still bounds retries. Registered tools retain precedence and all permission checks.
-- Delegated child agents inherit the parent's skills list; their reads aren't recorded in the parent.
+- Selection order in `ask`: `/skill` forced -> `match_skill` similarity (cosine, `skill_similarity`, >= `--skill-threshold`) -> `select_skills` model pass only if nothing matched -> model may still `read_file` a skill. Triggers: `explicit`, `similarity`, `model-select`, `model`.
+- Skill log: `log_skill_event` appends `match`/`model_select`/`executed`/`finished` JSON lines to `.mini-coding-agent/skills.jsonl` (never bodies); CLI echoes `[skills] ...` to stderr.
+- Delegated child agents inherit the parent's skills list; their reads aren't recorded in the parent; they skip the similarity check.
 
 ## Verification <!-- healthy output -->
 - `pytest -q`: all pass, none skipped; `lab4` tests pass separately.

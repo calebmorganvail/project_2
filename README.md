@@ -49,12 +49,17 @@ Instructions...
 - The selection pass is skipped when there are no skills or when `/skill` forces one. It does not consume tool steps, but adds model inference time and compute. Selection is probabilistic: loading a skill does not prove that the task was completed.
 - The model can also load a skill by calling `read_file` on its listed `SKILL.md`. If it mistakenly calls a skill name as a tool, the agent returns the correct `read_file` call without consuming a tool step; repeated mistakes remain bounded.
 - Active skill bodies are included in each task prompt for the current request only, never in history, memory or the session file. The session records `skills_used`.
+- **Similarity check (runs first):** every prompt is scored against each skill's name + description (cosine similarity of word counts, 0-1). If the best skill scores at least `--skill-threshold` (default 0.25) it is loaded right away and the model selection call above is skipped. Only when nothing scores high enough does the model selection pass run.
+- **Skill log:** the prompt, every similarity score, the model selection result, the executed skill with its trigger (`explicit`, `similarity`, `model-select` or `model`), and the end of each skill run are appended to `.mini-coding-agent/skills.jsonl` and echoed as `[skills] ...` lines on stderr. A saved Lab 4 run is in `docs/runs/`.
 - `/skill` lists skills; `/skill <name> <prompt>` forces a skill for that prompt (also works as a one-shot CLI prompt).
 - Delegation is unavailable while a skill is active because child agents do not inherit active skill instructions. Delegation remains available before skill activation and after the request ends. A rejected delegation still counts toward the step limit.
 - Skills do not restrict tools or enforce read-only instructions. Writing, patching and shell commands remain available subject to the configured approval policy.
 - Invalid skills are skipped with a one-line `warning: skipped skills/<folder>/SKILL.md: <reason>` on stderr.
 - Bodies are truncated with a `[skill truncated at N chars]` notice: 4000 chars for models <=4B, 12000 for <=13B, 24000 otherwise. Override with `--skill-max-chars N`.
 - Limits: multi-line and quoted frontmatter values are not supported (quotes are kept literally; `|`/`>` values are invalid); skills added mid-session appear after `/reset`; skills must be reloaded in each new request; reading a `SKILL.md` for any reason activates it until the request ends.
+
+## Context window
+`--num-ctx` (default 8192) sets Ollama's context window in tokens. Ollama silently drops the start of a prompt that is longer than its context window, and the start is where the rules, tools and skill instructions are. The character limits above do not guarantee a token budget, so raise `--num-ctx` for long sessions if your machine has the memory.
 
 ## Test
 ```bash

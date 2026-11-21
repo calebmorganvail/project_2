@@ -1,6 +1,6 @@
 ---
 name: train-and-report
-description: Train the vacuum robot Q-learning agent in lab4, run its tests, and report the hyperparameters, learned policy and results.
+description: Solve Lab 4: train the vacuum robot Q-learning agent in lab4, run its tests, and report the hyperparameters, learned policy and results.
 ---
 
 # Train and Report
