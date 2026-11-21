@@ -46,7 +46,8 @@ Sessions/logs live in `.mini-coding-agent/` (gitignored): `sessions/`, `skills.j
 - Model must emit `<tool>...</tool>` or `<final>...</final>`; `ask` limits tool calls and permits one final-only turn after exhaustion.
 - Tools: `read_file`, `write_file`, `patch_file`, `run_shell`, `delegate`, etc. Risky ones (`run_shell`, `write_file`, `patch_file`) go through `approve()`.
 - Prompt = stable prefix (+ skills list) + memory + transcript; tool results retain up to 16,000 characters, and recent transcript results have a 3,000-character allowance.
-- Skills: discovered from `<root>/skills/*/SKILL.md` only; body is loaded when the model `read_file`s a SKILL.md (or `/skill`), held in `active_skills` for that request only, cleared in `ask`'s `finally`. Bodies never enter `history`, `memory`, or session JSON (only `[skill loaded: ...]` notes and `skills_used`).
+- Skills: discovered from `<root>/skills/*/SKILL.md` only. Ordinary requests with skills get a separate bounded model selection pass; selected files are validated and loaded before the normal loop. `/skill` forces a skill without selection, and an empty catalog skips selection. A model may still load a skill with `read_file`. Bodies live in `active_skills` for that request only and are cleared in `ask`'s `finally`; they never enter `history`, `memory`, or session JSON (only load notices and `skills_used`).
+- An unknown tool name matching a skill yields its `read_file` example without consuming a tool step; the response-attempt limit still bounds retries. Registered tools retain precedence and all permission checks.
 - Delegated child agents inherit the parent's skills list; their reads aren't recorded in the parent.
 
 ## Verification <!-- healthy output -->

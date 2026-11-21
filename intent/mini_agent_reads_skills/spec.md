@@ -4,6 +4,18 @@ Source: [intent.md](./intent.md)
 ## Scope update: agent-wide output and reporting
 The output and final-answer requirements below apply to every request, whether or not a skill is available or active. They intentionally change the original no-skill baseline while preserving skill discovery, activation, permissions, and unrelated existing behavior. The original intent remains unchanged.
 
+## Scope update: implicit skill selection and recovery
+Add a selection pass so that matching skills are selected and loaded in the parent agent before it begins normal task execution or delegates work. This update supersedes the earlier model-driven loading decision and REQ-10, REQ-27 and REQ-34 where they conflict with the requirements below; explicit `/skill` invocation and on-demand `read_file` activation remain supported.
+
+- **REQ-046** For each ordinary user request when skills are available, make a separate model selection pass before the normal agent loop. Provide the current request, relevant recent user context for follow-ups, and the discovered skill names and descriptions; do not include unloaded skill bodies. The pass may select zero, one, or multiple skills by name.
+- **REQ-047** Require a structured selection result and validate it against the discovered skill names before loading anything. A valid empty selection proceeds without an active skill. Retry malformed results or unknown names a bounded number of times; if selection still fails, report the failure explicitly and do not proceed as though no skill matched.
+- **REQ-048** For every selected skill, load the corresponding discovered `SKILL.md` in the parent and activate it before the first normal model turn. Use the existing per-skill cap, request-scoped active state and `skills_used` recording; report a loading failure explicitly instead of continuing as if the skill were loaded. Do not copy skill bodies into session history or memory.
+- **REQ-049** When no skills are discovered, skip the selection pass and preserve existing no-skill behavior. An explicit `/skill <name> <prompt>` continues to force that skill for the request without requiring implicit selection.
+- **REQ-050** When a tool name is not registered, compare it exactly against discovered skill names. If it matches, return an error explaining that the name is a skill, not a tool, and provide the exact `read_file` call for its discovered path. Otherwise preserve the existing unknown-tool error. Registered tools retain precedence and existing permissions remain unchanged.
+- **REQ-051** Selection and activation do not grant permission to execute commands or change child agents' read-only status. Active skills remain scoped to the current request and are cleared on all existing exit paths; later requests must select or load them again.
+- **REQ-052** Do not include the cost of the skill selection pass or the comparison against skill names for an unregistered tool name in the tool use limit. The skill selection pass must happen every query and should not contribute any additional cost.
+- **REQ-053** Add focused tests for matching, no-match, multiple-skill and follow-up selections; invalid results and loading failures; unknown-tool skill-name recovery and ordinary unknown tools; and parent activation before delegation. Evaluate selection quality separately with representative requests on the target model: deterministic loading after selection does not guarantee correct model selection.
+
 ## Decisions (confirmed with the team)
 | Topic | Decision |
 |---|---|
