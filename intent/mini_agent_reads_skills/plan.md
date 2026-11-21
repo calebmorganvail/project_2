@@ -272,6 +272,18 @@ Write each test once, in `tests/test_mini_coding_agent.py`. Use a small helper t
 | REQ-044 | Steps 10-13 no-skill, permission, and body-privacy compatibility |
 | REQ-045 | Step 14 documentation (T025) |
 
+## Step 15: Similarity check, skill log and context window (REQ-046-051)
+- Add `skill_tokens` and `skill_similarity` (module level, stdlib).
+- `MiniAgent.match_skill` runs at the start of `ask` (inside the existing `try/finally`), logs the `match` entry and activates the selected skill through `activate_skill` with a trigger. `activate_skill` logs `executed` once per skill per request; the `finally` logs `finished` before clearing active skills.
+- `MiniAgent.log_skill_event` appends to `.mini-coding-agent/skills.jsonl`; the CLI turns on the stderr echo.
+- `OllamaModelClient` sends `num_ctx`; new flags `--num-ctx` and `--skill-threshold`.
+- `train-and-report` description starts with "Solve Lab 4:" so that prompt passes the threshold.
+- Tests: tokenizer and bounds, repo skill matches Lab 4 prompts, similarity activation + log contents, no-match logging, model and explicit triggers, single `executed` on re-read, threshold off, no log without skills, echo off by default, `num_ctx` payload.
+
+| REQ | Covered by |
+|---|---|
+| REQ-046-051 | Step 15 |
+
 ## Done criteria
 - Every testable behavior requirement has at least one passing test; verify documentation by inspection and selection quality manually (C6).
 - Existing tests for unchanged behavior pass; changed tests match the revised no-skill, output, and final-answer requirements.

@@ -18,7 +18,7 @@ uv run pytest -q                          # or: python -m pytest -q   (agent tes
 cd lab4 && python -m pytest               # Lab 4 tests
 uv run ruff check .
 ```
-CLI flags: `--cwd --model --host --ollama-timeout --resume --approval {ask,auto,never} --max-steps(6) --max-new-tokens(512) --temperature(0.2) --top-p(0.9) --skill-max-chars --show-command-output`.
+CLI flags: `--cwd --model --host --ollama-timeout --resume --approval {ask,auto,never} --max-steps(6) --max-new-tokens(512) --temperature(0.2) --top-p(0.9) --skill-max-chars --skill-threshold(0.25) --num-ctx(8192) --show-command-output`.
 REPL commands: `/help /memory /session /reset /exit /quit /skill [<name> <prompt>]`.
 
 ## Layout
@@ -47,7 +47,9 @@ Sessions/logs live in `.mini-coding-agent/` (gitignored): `sessions/`, `skills.j
 - Tools: `read_file`, `write_file`, `patch_file`, `run_shell`, `delegate`, etc. Risky ones (`run_shell`, `write_file`, `patch_file`) go through `approve()`.
 - Prompt = stable prefix (+ skills list) + memory + transcript; tool results retain up to 16,000 characters, and recent transcript results have a 3,000-character allowance.
 - Skills: discovered from `<root>/skills/*/SKILL.md` only; body is loaded when the model `read_file`s a SKILL.md (or `/skill`), held in `active_skills` for that request only, cleared in `ask`'s `finally`. Bodies never enter `history`, `memory`, or session JSON (only `[skill loaded: ...]` notes and `skills_used`).
-- Delegated child agents inherit the parent's skills list; their reads aren't recorded in the parent.
+- Skill selection: `match_skill` scores every prompt (cosine similarity, `skill_similarity`) and auto-activates the best skill >= `--skill-threshold`; otherwise the model may `read_file` a skill; `/skill` forces one. Triggers: `similarity`, `model`, `explicit`.
+- Skill log: `log_skill_event` appends `match`/`executed`/`finished` JSON lines to `.mini-coding-agent/skills.jsonl` (never bodies); CLI echoes `[skills] ...` to stderr.
+- Delegated child agents inherit the parent's skills list; their reads aren't recorded in the parent; they skip the similarity check.
 
 ## Verification <!-- healthy output -->
 - `pytest -q`: all pass, none skipped; `lab4` tests pass separately.

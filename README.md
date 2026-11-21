@@ -46,12 +46,17 @@ description: Train the vacuum robot and report results.
 Instructions...
 ```
 - Only name, description and path go in the prompt. The model loads the body by calling `read_file` on the `SKILL.md`; the body is then active for that request only and is never saved in history, memory or the session file (the session records `skills_used`).
+- **Similarity check:** every prompt is scored against each skill's name + description (cosine similarity of word counts). The best skill scoring at least `--skill-threshold` (default 0.25) is loaded automatically for that request. Below the threshold the model can still load a skill with `read_file`.
+- **Skill log:** the prompt, every similarity score, the selected skill and its trigger (`similarity`, `model` or `explicit`), and the end of each skill run are appended to `.mini-coding-agent/skills.jsonl` and echoed as `[skills] ...` lines on stderr.
 - `/skill` lists skills; `/skill <name> <prompt>` forces a skill for that prompt (also works as a one-shot CLI prompt).
 - Delegation is unavailable while a skill is active because child agents do not inherit active skill instructions. Delegation remains available before skill activation and after the request ends. A rejected delegation still counts toward the step limit.
 - Skills do not restrict tools or enforce read-only instructions. Writing, patching and shell commands remain available subject to the configured approval policy.
 - Invalid skills are skipped with a one-line `warning: skipped skills/<folder>/SKILL.md: <reason>` on stderr.
 - Bodies are truncated with a `[skill truncated at N chars]` notice: 4000 chars for models <=4B, 12000 for <=13B, 24000 otherwise. Override with `--skill-max-chars N`.
 - Limits: multi-line and quoted frontmatter values are not supported (quotes are kept literally; `|`/`>` values are invalid); skills added mid-session appear after `/reset`; skills must be reloaded in each new request; reading a `SKILL.md` for any reason activates it until the request ends.
+
+## Context window
+`--num-ctx` (default 8192) sets Ollama's context window in tokens. Ollama silently drops the start of a prompt that is longer than its context window, and the start is where the rules, tools and skill instructions are. The character limits above do not guarantee a token budget, so raise `--num-ctx` for long sessions if your machine has the memory.
 
 ## Test
 ```bash

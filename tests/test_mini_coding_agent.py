@@ -16,6 +16,8 @@ from mini_coding_agent import (
     discover_skills,
     main,
     skill_cap_for_model,
+    skill_similarity,
+    skill_tokens,
     truncate_skill,
 )
 
@@ -1276,3 +1278,138 @@ def test_skill_max_chars_flag():  # REQ-30, 31
         build_arg_parser().parse_args(["--skill-max-chars", "0"])
     assert build_arg_parser().parse_args([]).skill_max_chars is None
     assert build_arg_parser().parse_args(["--skill-max-chars", "7"]).skill_max_chars == 7
+
+
+#####################################################
+#### Skills: similarity check and skill log #########
+#####################################################
+def read_skill_log(root):
+    path = root / ".mini-coding-agent" / "skills.jsonl"
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def test_skill_tokens_and_similarity_bounds():  # REQ-046
+    assert skill_tokens("Solve the Lab4 tests") == ["solve", "lab", "4", "test"]
+    assert skill_similarity("vacuum robot", "vacuum robot") == pytest.approx(1.0)
+    assert skill_similarity("vacuum robot", "binary search") == 0.0
+    assert skill_similarity("", "anything") == 0.0
+
+
+def test_repo_skill_matches_lab4_prompts():  # REQ-046, REQ-047
+    skills, _ = discover_skills(Path(__file__).resolve().parent.parent)
+    skill = next(s for s in skills if s["name"] == "train-and-report")
+    text = f"train and report {skill['description']}"
+    assert skill_similarity("train the vacuum robot and report the results", text) >= 0.25
+    assert skill_similarity("solve lab 4", text) >= 0.25
+    assert skill_similarity("write a binary search function", text) < 0.25
+
+
+def test_similar_prompt_activates_skill_and_logs_it(tmp_path):  # REQ-047, REQ-048
+    write_skill(tmp_path, "vacuum", description="Train the vacuum robot and report results", body="STEP-ONE\n")
+    write_skill(tmp_path, "review", description="Review a pull request diff")
+    agent = build_agent(tmp_path, ["<final>report</final>"])
+
+    assert agent.ask("train the vacuum robot") == "report"
+
+    assert "\n\nActive skills:\n### vacuum\nSTEP-ONE" in agent.model_client.prompts[0]
+    assert agent.active_skills == {}
+    log = read_skill_log(tmp_path)
+    assert [entry["event"] for entry in log] == ["match", "executed", "finished"]
+    match = log[0]
+    assert match["prompt"] == "train the vacuum robot"
+    assert match["scores"]["vacuum"] >= match["threshold"] > match["scores"]["review"]
+    assert match["selected"] == "vacuum" and match["trigger"] == "similarity"
+    assert log[1]["skill"] == "vacuum" and log[1]["trigger"] == "similarity"
+    assert log[2]["answer"] == "report"
+    assert agent.session["skills_used"][0]["trigger"] == "similarity"
+    assert "STEP-ONE" not in json.dumps(agent.session)
+
+
+def test_unrelated_prompt_logs_match_without_selection(tmp_path):  # REQ-047, REQ-048
+    write_skill(tmp_path, "vacuum", description="Train the vacuum robot", body="STEP-ONE\n")
+    agent = build_agent(tmp_path, ["<final>ok</final>"])
+
+    agent.ask("write a binary search function")
+
+    assert "Active skills" not in agent.model_client.prompts[0]
+    log = read_skill_log(tmp_path)
+    assert [entry["event"] for entry in log] == ["match"]
+    assert log[0]["selected"] is None and log[0]["trigger"] is None
+
+
+def test_model_loaded_skill_is_logged_with_model_trigger(tmp_path):  # REQ-048
+    write_skill(tmp_path, "vacuum", description="Train the vacuum robot", body="STEP-ONE\n")
+    agent = build_agent(tmp_path, [read_call("skills/vacuum/SKILL.md"), "<final>ok</final>"])
+
+    agent.ask("write a binary search function")
+
+    executed = [entry for entry in read_skill_log(tmp_path) if entry["event"] == "executed"]
+    assert len(executed) == 1
+    assert executed[0]["skill"] == "vacuum" and executed[0]["trigger"] == "model"
+
+
+def test_rereading_auto_loaded_skill_logs_execution_once(tmp_path):  # REQ-048
+    write_skill(tmp_path, "vacuum", description="Train the vacuum robot", body="STEP-ONE\n")
+    agent = build_agent(tmp_path, [read_call("skills/vacuum/SKILL.md"), "<final>ok</final>"])
+
+    agent.ask("train the vacuum robot")
+
+    events = [entry["event"] for entry in read_skill_log(tmp_path)]
+    assert events == ["match", "executed", "finished"]
+
+
+def test_threshold_none_disables_automatic_selection(tmp_path):  # REQ-047
+    write_skill(tmp_path, "vacuum", description="Train the vacuum robot")
+    agent = build_agent(tmp_path, ["<final>ok</final>"], skill_threshold=None)
+
+    agent.ask("train the vacuum robot")
+
+    assert "Active skills" not in agent.model_client.prompts[0]
+    assert read_skill_log(tmp_path)[0]["selected"] is None
+
+
+def test_forced_skill_is_logged_as_explicit(tmp_path, capsys):  # REQ-048, REQ-049
+    write_skill(tmp_path, "a", body="FORCED-BODY\n")
+    run_main(tmp_path, ["<final>ok</final>"], inputs=["/skill a write a binary search"])
+
+    log = read_skill_log(tmp_path)
+    assert log[0]["event"] == "match" and log[0]["selected"] == "a" and log[0]["trigger"] == "explicit"
+    assert log[1]["event"] == "executed" and log[1]["trigger"] == "explicit"
+    assert "[skills] executing skill 'a' (trigger=explicit)" in capsys.readouterr().err
+
+
+def test_no_skills_writes_no_skill_log(tmp_path):  # REQ-050
+    agent = build_agent(tmp_path, ["<final>ok</final>"])
+    agent.ask("train the vacuum robot")
+    assert not (tmp_path / ".mini-coding-agent" / "skills.jsonl").exists()
+
+
+def test_skill_log_echo_is_off_by_default(tmp_path, capsys):  # REQ-048
+    write_skill(tmp_path, "vacuum", description="Train the vacuum robot")
+    build_agent(tmp_path, ["<final>ok</final>"]).ask("train the vacuum robot")
+    assert "[skills]" not in capsys.readouterr().err
+
+
+def test_ollama_num_ctx_is_sent_and_configurable():  # REQ-051
+    captured = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return json.dumps({"response": "ok"}).encode("utf-8")
+
+    def fake_urlopen(request, timeout):
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return FakeResponse()
+
+    client = OllamaModelClient(model="m", host="http://h", temperature=0.2, top_p=0.9, timeout=5, num_ctx=16384)
+    with patch("urllib.request.urlopen", fake_urlopen):
+        client.complete("hi", 10)
+    assert captured["body"]["options"]["num_ctx"] == 16384
+    assert build_arg_parser().parse_args([]).num_ctx == 8192
+    assert build_arg_parser().parse_args([]).skill_threshold == 0.25
