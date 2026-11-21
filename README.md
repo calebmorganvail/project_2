@@ -45,7 +45,10 @@ description: Train the vacuum robot and report results.
 ---
 Instructions...
 ```
-- Only name, description and path go in the prompt. The model loads the body by calling `read_file` on the `SKILL.md`; the body is then active for that request only and is never saved in history, memory or the session file (the session records `skills_used`).
+- For each ordinary request with available skills, the agent makes a separate model call to select matching skills from their names and descriptions, using recent user requests as context for follow-ups. It validates the response and loads the selected skill files before the first task turn. Invalid selections are retried up to three times; selection or loading failures stop the request with an error.
+- The selection pass is skipped when there are no skills or when `/skill` forces one. It does not consume tool steps, but adds model inference time and compute. Selection is probabilistic: loading a skill does not prove that the task was completed.
+- The model can also load a skill by calling `read_file` on its listed `SKILL.md`. If it mistakenly calls a skill name as a tool, the agent returns the correct `read_file` call without consuming a tool step; repeated mistakes remain bounded.
+- Active skill bodies are included in each task prompt for the current request only, never in history, memory or the session file. The session records `skills_used`.
 - `/skill` lists skills; `/skill <name> <prompt>` forces a skill for that prompt (also works as a one-shot CLI prompt).
 - Delegation is unavailable while a skill is active because child agents do not inherit active skill instructions. Delegation remains available before skill activation and after the request ends. A rejected delegation still counts toward the step limit.
 - Skills do not restrict tools or enforce read-only instructions. Writing, patching and shell commands remain available subject to the configured approval policy.
@@ -58,6 +61,7 @@ Instructions...
 python -m pytest            # agent
 cd lab4 && python -m pytest # Lab 4
 ```
+The agent tests use fake model responses; neither pytest suite requires Ollama. For real-model skill-selection testing, Ollama must be running with `qwen3.5:4b` installed (`ollama pull qwen3.5:4b`).
 
 ## Credit
 `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` and `LICENSE` (Apache 2.0) come from rasbt/mini-coding-agent.

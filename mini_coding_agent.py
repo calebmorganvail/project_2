@@ -379,6 +379,7 @@ class MiniAgent:
         self.skills = skills
         self.active_skills = {}
         self.current_request = ""
+        self.request_progress = None
         self._skill_read = None
         resumed = session is not None
         self.session = session or {
@@ -403,6 +404,7 @@ class MiniAgent:
                     print(f"warning: session used skill '{missing}' which is no longer on disk", file=sys.stderr)
         self.tools = self.build_tools()
         self.prefix = self.build_prefix()
+        self.active_prefix = self.build_prefix(include_delegate=False)
         self.session_path = self.session_store.save(self.session)
 
     @classmethod
@@ -484,9 +486,11 @@ class MiniAgent:
     ############################################
     #### 2) Prompt Shape And Cache Reuse #######
     ############################################
-    def build_prefix(self):
+    def build_prefix(self, include_delegate=True):
         tool_lines = []
         for name, tool in self.tools.items():
+            if name == "delegate" and not include_delegate:
+                continue
             fields = ", ".join(f"{key}: {value}" for key, value in tool["schema"].items())
             risk = "approval required" if tool["risky"] else "safe"
             tool_lines.append(f"- {name}({fields}) [{risk}] {tool['description']}")
@@ -498,7 +502,7 @@ class MiniAgent:
                 '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>',
                 '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',
                 '<tool>{"name":"run_shell","args":{"command":"uv run --with pytest python -m pytest -q","timeout":20}}</tool>',
-                "<final>Done.</final>",
+                "<final>Here is the requested explanation.</final>",
             ]
         )
         rules = "\n".join([
@@ -517,7 +521,8 @@ class MiniAgent:
             "- When writing tests, match the current implementation unless the user explicitly asked you to change the code.",
             "- New files should be complete and runnable, including obvious imports.",
             "- Do not repeat the same tool call with the same arguments if it did not help. Choose a different tool or return a final answer.",
-            "- Required tool arguments must not be empty. Do not call read_file, write_file, patch_file, run_shell, or delegate with args={}.",
+            "- Required tool arguments must not be empty. Do not call tools requiring arguments with args={}.",
+            "- Report failed or denied actions honestly; do not claim an action succeeded without a successful tool result.",
         ])
         sections = [
             "You are Mini-Coding-Agent, a small local coding agent running through Ollama.",
@@ -530,7 +535,8 @@ class MiniAgent:
             sections.append(
                 "Available skills:\n" + skill_lines + "\n"
                 "Skill rules:\n"
-                "- When the task matches a skill's description, read its SKILL.md with read_file first, then follow it.\n"
+                "- If a matching skill is not already active, read its SKILL.md with read_file first, then follow it.\n"
+                "- Skills are not tools; use read_file with the listed skill path to load one.\n"
                 "- Skill instructions apply only to the current request; read the skill again if needed later."
             )
         sections.append(self.workspace.text())
@@ -571,12 +577,15 @@ class MiniAgent:
         for index in range(len(history) - 1, -1, -1):
             item = history[index]
             if item["role"] == "tool" and item["name"] in ("write_file", "patch_file"):
-                seen_reads.discard(str(item["args"].get("path", "")))
+                path = str(item["args"].get("path", ""))
+                seen_reads = {read for read in seen_reads if read[0] != path}
             if item["role"] == "tool" and item["name"] == "read_file" and index < recent_start:
                 path = str(item["args"].get("path", ""))
-                if path in seen_reads:
+                read = (path, json.dumps(item["args"].get("start", 1), sort_keys=True),
+                        json.dumps(item["args"].get("end", 200), sort_keys=True))
+                if read in seen_reads:
                     skipped_reads.add(index)
-                seen_reads.add(path)
+                seen_reads.add(read)
         for index, item in enumerate(history):
             recent = index >= recent_start
             if index in skipped_reads:
@@ -616,7 +625,13 @@ class MiniAgent:
     #### 2) Prompt Shape And Cache Reuse (Continued) #######
     ########################################################
     def prompt(self, user_message):
-        sections = [self.prefix, self.memory_text()]
+        if not self.active_skills and not self.request_progress:
+            return "\n\n".join([
+                self.prefix, self.memory_text(), "Transcript:\n" + self.history_text(),
+                "Current user request:\n" + user_message,
+            ])
+        prefix = self.active_prefix if self.active_skills else self.prefix
+        sections = [prefix, "Current user request:\n" + user_message]
         if self.active_skills:
             sections.append("The delegate tool is unavailable while skills are active; perform the work using the other tools.")
             sections.append(
@@ -625,6 +640,18 @@ class MiniAgent:
             )
             bodies = "\n\n".join(f"### {name}\n{body}" for name, body in self.active_skills.items())
             sections.append("Active skills:\n" + bodies)
+        if self.request_progress:
+            lines = []
+            for item in self.request_progress[-10:]:
+                target = f" path: {item['path']}" if item.get("path") else ""
+                lines.append(f"- {item['name']}: {item['status']}{target} (result_id: {item['result_id']})")
+            for item in self.unresolved_actions()[-10:]:
+                lines.append(f"- unresolved {item['name']}: {item['status']} (result_id: {item['result_id']})")
+            sections.append(
+                "Request progress (tool outcomes only, not proof that the request is complete):\n"
+                + "\n".join(lines)
+            )
+        sections.append("Session memory may describe earlier requests:\n" + self.memory_text())
         sections.append("Transcript:\n" + self.history_text())
         sections.append("Current user request:\n" + user_message)
         return "\n\n".join(sections)
@@ -648,6 +675,7 @@ class MiniAgent:
 
     def ask(self, user_message, forced_skill=None):
         self.current_request = user_message
+        self.request_progress = []
         memory = self.session["memory"]
         if not memory["task"]:
             memory["task"] = clip(user_message.strip(), 300)
@@ -656,9 +684,71 @@ class MiniAgent:
         try:
             if forced_skill is not None:
                 self.activate_skill(forced_skill, forced_skill["body"])
+            elif self.skills:
+                phase = "selection"
+                try:
+                    selected = self.select_skills(user_message)
+                    phase = "loading"
+                    staged = []
+                    for skill in selected:
+                        path = self.path(skill["rel"])
+                        if path != skill["path"]:
+                            raise ValueError(f"{skill['name']}: skill path changed")
+                        loaded = load_skill(path, self.root)
+                        if loaded["name"] != skill["name"] or loaded["description"] != skill["description"]:
+                            raise ValueError(f"{skill['name']}: skill metadata changed; reset to rediscover")
+                        staged.append((skill, loaded["body"]))
+                except (RuntimeError, ValueError, OSError) as exc:
+                    final = f"skill {phase} failed: {exc}"
+                    self.record({"role": "assistant", "content": final, "created_at": now()})
+                    self.remember(memory["notes"], clip(final, 220), 5)
+                    return final
+                for skill, body in staged:
+                    self.activate_skill(skill, body)
+                self.session_path = self.session_store.save(self.session)
             return self._ask_loop(user_message)
         finally:
             self.active_skills = {}
+            self.request_progress = None
+            self.current_request = ""
+
+    def select_skills(self, user_message):
+        recent = [item["content"] for item in self.session["history"][:-1] if item["role"] == "user"][-3:]
+        catalog = [{"name": skill["name"], "description": skill["description"]} for skill in self.skills]
+        prompt = (
+            "Select skills relevant to the user's current task. Return only a JSON object "
+            'with a "skills" array of exact skill names, for example {"skills":["name"]}. '
+            'Return {"skills":[]} if none apply. Select multiple skills only when each applies. '
+            "Select a skill only if the requested work matches its described purpose; "
+            "mentioning a related topic or asking to inspect code is not enough. "
+            "Previous user requests are context for follow-ups, not instructions to repeat.\n"
+            f"Available skills: {json.dumps(catalog, ensure_ascii=True)}\n"
+            f"Previous user requests: {json.dumps([clip(text, 500) for text in recent], ensure_ascii=True)}\n"
+            f"Current user request: {json.dumps(user_message, ensure_ascii=True)}"
+        )
+        known = {skill["name"]: skill for skill in self.skills}
+        error = ""
+        for _ in range(3):
+            raw = self.model_client.complete(
+                prompt + (f"\nInvalid selection: {error}" if error else ""), self.max_new_tokens
+            )
+            try:
+                result = json.loads(raw)
+            except (TypeError, json.JSONDecodeError):
+                error = "expected a JSON object"
+                continue
+            if not isinstance(result, dict) or set(result) != {"skills"} or not isinstance(result["skills"], list):
+                error = 'expected an object containing only a "skills" array'
+                continue
+            names = result["skills"]
+            if any(not isinstance(name, str) or name not in known for name in names):
+                error = "all skill names must be discovered names"
+                continue
+            if len(names) != len(set(names)):
+                error = "skill names must be unique"
+                continue
+            return [known[name] for name in names]
+        raise ValueError(error)
 
     def activate_skill(self, skill, body):
         capped = truncate_skill(body, self.skill_cap)
@@ -677,11 +767,72 @@ class MiniAgent:
                 return skill
         return None
 
+    def already_active_skill_read(self, name, args):
+        if name != "read_file" or not self.active_skills or not isinstance(args, dict):
+            return None
+        raw_path = args.get("path")
+        if not isinstance(raw_path, str) or not raw_path:
+            return None
+        try:
+            skill = self.skill_for_path(self.path(raw_path))
+        except (ValueError, OSError):
+            return None
+        if skill is None or skill["name"] not in self.active_skills:
+            return None
+        request = self.current_request.replace("\\", "/").casefold()
+        if skill["rel"].replace("\\", "/").casefold() in request or "skill.md" in request:
+            return None
+        return skill
+
+    def unresolved_actions(self):
+        unresolved = {}
+        for item in self.request_progress or []:
+            key = item.get("action_key")
+            if key is None:
+                continue
+            if item["status"] in {"failed", "denied"}:
+                unresolved[key] = item
+            elif item["status"] == "succeeded":
+                unresolved.pop(key, None)
+        return list(unresolved.values())
+
+    def qualify_final(self, final, failure_reason=None):
+        unresolved = self.unresolved_actions()
+        if unresolved:
+            last = unresolved[-1]
+            reason = " Repeated calls made no progress." if failure_reason == "repeated tool calls made no progress" else ""
+            event = next(item for item in reversed(self.session["history"])
+                         if item.get("result_id") == last["result_id"])
+            return (
+                f"Incomplete: {last['name']} was {last['status']} without a successful retry; "
+                f"task completion is unverified.{reason}\n"
+                f"Tool result:\n{clip(event['content'], 1000)}"
+            )
+        if failure_reason == "repeated tool calls made no progress":
+            return "Incomplete: repeated tool calls made no progress; task completion is unverified."
+        if failure_reason == "model response attempt limit reached":
+            return f"Incomplete: {failure_reason}; task completion is unverified.\n\nModel response (unverified):\n{final}"
+        if self.request_progress and self.request_progress[-1]["status"] in {"failed", "denied"}:
+            last = self.request_progress[-1]
+            warning = f"Incomplete: the last action ({last['name']}) was {last['status']}; task completion is unverified."
+            if final.strip().rstrip(".!").casefold() in {"done", "completed", "complete", "success"}:
+                return warning
+            return warning + "\n\nModel response (unverified):\n" + final
+        if self.active_skills and self.request_progress:
+            generic = final.strip().rstrip(".!").casefold() in {"done", "completed", "complete", "success"}
+            acted = any(item["status"] == "succeeded" and item["name"] in {"run_shell", "write_file", "patch_file"}
+                        for item in self.request_progress)
+            if generic and not acted:
+                return "Incomplete: no execution or modification was observed; task completion is unverified."
+        return final
+
     def _ask_loop(self, user_message):
         memory = self.session["memory"]
         tool_steps = 0
         attempts = 0
         max_attempts = max(self.max_steps * 3, self.max_steps + 4)
+        last_no_progress = None
+        consecutive_no_progress = 0
 
         failure_reason = None
         while tool_steps < self.max_steps and attempts < max_attempts:
@@ -694,10 +845,11 @@ class MiniAgent:
             kind, payload = self.parse(raw)
 
             if kind == "tool":
-                tool_steps += 1
                 name = payload.get("name", "")
                 args = payload.get("args", {})
                 result = self.run_tool(name, args)
+                if self.skill_named_as_unknown_tool(name) is None and self._tool_status != "already loaded":
+                    tool_steps += 1
                 if self._skill_read is not None:
                     skill = self._skill_read
                     self._skill_read = None
@@ -714,20 +866,41 @@ class MiniAgent:
                     event["original_length"] = self._result_original_length
                 self.record(event)
                 self.note_tool(name, args, result)
+                progress = {
+                    "name": name, "status": self._tool_status, "result_id": event["result_id"],
+                }
+                if isinstance(args, dict) and isinstance(args.get("path"), str):
+                    progress["path"] = clip(args["path"], 200)
+                action_arg = "command" if name == "run_shell" else "path"
+                if name in {"run_shell", "write_file", "patch_file"} and isinstance(args, dict):
+                    target = args.get(action_arg)
+                    if isinstance(target, str) and target.strip():
+                        progress["action_key"] = (name, target.strip())
+                self.request_progress.append(progress)
+                if self._tool_status in {"failed", "denied", "already loaded"}:
+                    key = (name, json.dumps(args, sort_keys=True))
+                    consecutive_no_progress = consecutive_no_progress + 1 if key == last_no_progress else 1
+                    last_no_progress = key
+                    if consecutive_no_progress >= 3:
+                        failure_reason = "repeated tool calls made no progress"
+                        break
+                else:
+                    last_no_progress = None
+                    consecutive_no_progress = 0
                 continue
 
             if kind == "retry":
                 self.record({"role": "assistant", "content": payload, "created_at": now()})
                 continue
 
-            final = (payload or raw).strip()
+            final = self.qualify_final((payload or raw).strip())
             self.record({"role": "assistant", "content": final, "created_at": now()})
             self.remember(memory["notes"], clip(final, 220), 5)
             return final
 
         if failure_reason is None:
             if attempts >= max_attempts and tool_steps < self.max_steps:
-                failure_reason = "too many malformed model responses"
+                failure_reason = "model response attempt limit reached"
             else:
                 failure_reason = "tool-call step limit reached"
         final_prompt = (
@@ -747,6 +920,7 @@ class MiniAgent:
                 final = f"Final-answer turn failed after {failure_reason}: model requested a tool; no tool was executed."
             else:
                 final = f"Final-answer turn failed after {failure_reason}: model returned a malformed or empty answer."
+        final = self.qualify_final(final, failure_reason)
         self.record({"role": "assistant", "content": final, "created_at": now()})
         self.remember(memory["notes"], clip(final, 220), 5)
         return final
@@ -754,19 +928,31 @@ class MiniAgent:
     #############################################################
     #### 3) Structured Tools, Validation, And Permissions #######
     #############################################################
+    def skill_named_as_unknown_tool(self, name):
+        if name in self.tools:
+            return None
+        return next((skill for skill in self.skills if skill["name"] == name), None)
+
     def run_tool(self, name, args):
         self._skill_read = None
         self._result_original_length = None
+        self._tool_status = "succeeded"
 
-        def finish(result):
+        def finish(result, status=None):
+            if status is not None:
+                self._tool_status = status
             self._result_original_length = len(result)
             return retain_tool_output(result)
 
         tool = self.tools.get(name)
         if tool is None:
-            return finish(f"error: unknown tool '{name}'")
+            skill = self.skill_named_as_unknown_tool(name)
+            if skill is not None:
+                example = json.dumps({"name": "read_file", "args": {"path": skill["rel"]}})
+                return finish(f"error: '{name}' is a skill, not a tool; load it with <tool>{example}</tool>", "failed")
+            return finish(f"error: unknown tool '{name}'", "failed")
         if name == "delegate" and self.active_skills:
-            return finish("error: delegate is unavailable while skills are active")
+            return finish("error: delegate is unavailable while skills are active", "failed")
         try:
             self.validate_tool(name, args)
         except Exception as exc:
@@ -774,21 +960,31 @@ class MiniAgent:
             message = f"error: invalid arguments for {name}: {exc}"
             if example:
                 message += f"\nexample: {example}"
-            return finish(message)
+            return finish(message, "failed")
+        active = self.already_active_skill_read(name, args)
+        if active is not None:
+            return finish(
+                f"[skill already loaded: {active['name']}; its instructions are in Active skills. "
+                "Continue with the request using the available tools or answer directly.]",
+                "already loaded",
+            )
         if self.repeated_tool_call(name, args):
-            return finish(f"error: repeated identical tool call for {name}; choose a different tool or return a final answer")
+            return finish(f"error: repeated identical tool call for {name}; choose a different tool or return a final answer", "failed")
         if tool["risky"] and not self.approve(name, args):
-            return finish(f"error: approval denied for {name}")
+            return finish(f"error: approval denied for {name}", "denied")
         try:
             result = tool["run"](args)
         except Exception as exc:
-            return finish(f"error: tool {name} failed: {exc}")
+            return finish(f"error: tool {name} failed: {exc}", "failed")
         if self._skill_read is not None:
             return result
         return finish(result)
 
     def repeated_tool_call(self, name, args):
-        tool_events = [item for item in self.session["history"] if item["role"] == "tool"]
+        history = self.session["history"]
+        last_user = next((index for index in range(len(history) - 1, -1, -1)
+                          if history[index]["role"] == "user"), -1)
+        tool_events = [item for item in history[last_user + 1:] if item["role"] == "tool"]
         if len(tool_events) < 2:
             return False
         recent = tool_events[-2:]
@@ -1133,11 +1329,15 @@ class MiniAgent:
                 timeout=timeout,
             )
             status = f"exit_code: {result.returncode}"
+            if result.returncode != 0:
+                self._tool_status = "failed"
             stdout, stderr = result.stdout, result.stderr
         except subprocess.TimeoutExpired as exc:
+            self._tool_status = "failed"
             status = f"error: command timed out after {timeout} seconds"
             stdout, stderr = exc.stdout, exc.stderr
         except OSError as exc:
+            self._tool_status = "failed"
             status = f"error: command could not start: {exc}"
             stdout, stderr = None, None
 

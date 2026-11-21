@@ -600,7 +600,8 @@ def test_active_skills_section_is_flush_left_and_prefix_stable(tmp_path):  # REQ
     agent.active_skills["alpha"] = "BODY"
     prompt = agent.prompt("hi")
 
-    assert "\n\nActive skills:\n### alpha\nBODY\n\nTranscript:" in prompt
+    assert "\n\nActive skills:\n### alpha\nBODY\n\n" in prompt
+    assert prompt.index("Active skills:") < prompt.index("Transcript:")
     assert agent.prefix == prefix_before
 
 
@@ -658,11 +659,11 @@ def read_call(path, **extra):
 
 def test_model_read_of_skill_activates_it(tmp_path):  # REQ-13, 27
     write_skill(tmp_path, "alpha", description="Alpha skill", body="STEP-ONE\n")
-    agent = build_agent(tmp_path, [read_call("skills/alpha/SKILL.md"), "<final>done</final>"])
+    agent = build_agent(tmp_path, ['{"skills":[]}', read_call("skills/alpha/SKILL.md"), "<final>done</final>"])
 
     agent.ask("do alpha work")
 
-    second_prompt = agent.model_client.prompts[1]
+    second_prompt = agent.model_client.prompts[2]
     assert "\n\nActive skills:\n### alpha\nSTEP-ONE" in second_prompt
     assert len(agent.session["skills_used"]) == 1
     assert agent.session["skills_used"][0]["name"] == "alpha"
@@ -677,24 +678,24 @@ def test_two_skills_active_together(tmp_path):  # REQ-14
     write_skill(tmp_path, "a", body="BODY-A\n")
     write_skill(tmp_path, "b", body="BODY-B\n")
     agent = build_agent(
-        tmp_path, [read_call("skills/a/SKILL.md"), read_call("skills/b/SKILL.md"), "<final>ok</final>"]
+        tmp_path, ['{"skills":[]}', read_call("skills/a/SKILL.md"), read_call("skills/b/SKILL.md"), "<final>ok</final>"]
     )
 
     agent.ask("both")
 
-    last = agent.model_client.prompts[2]
+    last = agent.model_client.prompts[3]
     assert "### a\nBODY-A" in last and "### b\nBODY-B" in last
 
 
 def test_reading_other_skill_files_does_not_activate(tmp_path):  # REQ-15
     write_skill(tmp_path, "a")
     (tmp_path / "skills" / "a" / "notes.md").write_text("extra notes\n", encoding="utf-8")
-    agent = build_agent(tmp_path, [read_call("skills/a/notes.md"), "<final>ok</final>"])
+    agent = build_agent(tmp_path, ['{"skills":[]}', read_call("skills/a/notes.md"), "<final>ok</final>"])
 
     agent.ask("read notes")
 
     assert "extra notes" in agent.session["history"][1]["content"]
-    assert "Active skills:" not in agent.model_client.prompts[1]
+    assert "Active skills:" not in agent.model_client.prompts[2]
     assert agent.session["skills_used"] == []
 
 
@@ -817,10 +818,10 @@ def test_one_shot_skill_prompt(tmp_path, capsys):  # REQ-21
 
 def test_skills_prefix_is_not_captured_by_skill_command(tmp_path):  # REQ-20
     write_skill(tmp_path, "a")
-    client, _ = run_main(tmp_path, ["<final>ok</final>"], inputs=["/skills something"])
+    client, _ = run_main(tmp_path, ['{"skills":[]}', "<final>ok</final>"], inputs=["/skills something"])
 
-    assert "Current user request:\n/skills something" in client.prompts[0]
-    assert "Active skills:" not in client.prompts[0]
+    assert "Current user request:\n/skills something" in client.prompts[1]
+    assert "Active skills:" not in client.prompts[1]
 
 
 ############################
@@ -841,17 +842,17 @@ def test_skills_inactive_after_request_ends(tmp_path, case):  # REQ-32, 33, 34
         "malformed": [read] + ["garbage <tool>"] * 20,
         "error": [read],
     }[case]
-    agent = build_agent(tmp_path, outputs, max_steps=2)
+    agent = build_agent(tmp_path, ['{"skills":[]}'] + outputs, max_steps=2)
 
     answer = agent.ask("go")
     if case == "error":
         assert "Final-answer turn failed" in answer
 
     assert agent.active_skills == {}
-    agent.model_client = FakeModelClient(["<final>next</final>"])
+    agent.model_client = FakeModelClient(['{"skills":[]}', "<final>next</final>"])
     agent.ask("next request")
-    assert "Active skills:" not in agent.model_client.prompts[0]
-    assert "BODY-A" not in agent.model_client.prompts[0]
+    assert "Active skills:" not in agent.model_client.prompts[1]
+    assert "BODY-A" not in agent.model_client.prompts[1]
 
 
 def test_model_client_error_during_forced_skill_clears_state(tmp_path):
@@ -866,11 +867,11 @@ def test_model_client_error_during_forced_skill_clears_state(tmp_path):
 
 def test_memory_shows_active_during_request_and_used_after(tmp_path):  # REQ-23
     write_skill(tmp_path, "a")
-    agent = build_agent(tmp_path, [read_call("skills/a/SKILL.md"), "<final>ok</final>"])
+    agent = build_agent(tmp_path, ['{"skills":[]}', read_call("skills/a/SKILL.md"), "<final>ok</final>"])
 
     agent.ask("go")
 
-    assert "- skills_active: a" in agent.model_client.prompts[1]
+    assert "- skills_active: a" in agent.model_client.prompts[2]
     assert "- skills_used: a\n- skills_active: -" in agent.memory_text()
 
 
@@ -890,7 +891,7 @@ def test_exit_eof_and_interrupt_leave_nothing_active(tmp_path):
 ############################
 def test_skills_used_round_trips_but_active_does_not(tmp_path):  # REQ-22
     write_skill(tmp_path, "a")
-    agent = build_agent(tmp_path, [read_call("skills/a/SKILL.md"), "<final>ok</final>"])
+    agent = build_agent(tmp_path, ['{"skills":[]}', read_call("skills/a/SKILL.md"), "<final>ok</final>"])
     agent.ask("go")
 
     resumed = MiniAgent.from_session(
@@ -912,7 +913,7 @@ def test_old_sessions_without_skills_used_load(tmp_path, value):  # REQ-25
     agent.session_path.write_text(json.dumps(data), encoding="utf-8")
 
     resumed = MiniAgent.from_session(
-        FakeModelClient([read_call("skills/a/SKILL.md"), "<final>ok</final>"]),
+        FakeModelClient(['{"skills":[]}', read_call("skills/a/SKILL.md"), "<final>ok</final>"]),
         agent.workspace,
         agent.session_store,
         agent.session["id"],
@@ -920,7 +921,8 @@ def test_old_sessions_without_skills_used_load(tmp_path, value):  # REQ-25
 
     assert resumed.session["skills_used"] == []
     assert "skills_used" not in resumed.memory_text()
-    resumed.ask("go")
+    assert resumed.ask("go") == "ok"
+    assert resumed.session["skills_used"][0]["name"] == "a"
     resumed.reset()
     assert resumed.session["skills_used"] == []
 
@@ -943,8 +945,9 @@ def test_resume_with_deleted_skill_warns_once(tmp_path, capsys):  # REQ-26
 
 def test_reset_clears_usage_and_rescans(tmp_path):  # REQ-4, 24
     write_skill(tmp_path, "a")
-    agent = build_agent(tmp_path, [read_call("skills/a/SKILL.md"), "<final>ok</final>"])
+    agent = build_agent(tmp_path, ['{"skills":[]}', read_call("skills/a/SKILL.md"), "<final>ok</final>"])
     agent.ask("go")
+    assert agent.session["skills_used"][0]["name"] == "a"
     write_skill(tmp_path, "b", description="Bee skill")
     (tmp_path / "skills" / "a" / "SKILL.md").unlink()
 
@@ -974,11 +977,13 @@ def test_delegate_blocked_until_active_skill_request_ends(tmp_path, forced):
     delegate = '<tool>{"name":"delegate","args":{"task":"investigate"}}</tool>'
     outputs = [delegate, "<final>skill request done</final>"]
     if not forced:
-        outputs.insert(0, read_call("skills/a/SKILL.md"))
-    outputs.extend([delegate, "<final>child result</final>", "<final>next request done</final>"])
+        outputs[:0] = ['{"skills":[]}', read_call("skills/a/SKILL.md")]
+    outputs.extend(['{"skills":[]}', delegate, '{"skills":[]}', "<final>child result</final>",
+                    "<final>next request done</final>"])
     agent = build_agent(tmp_path, outputs)
 
-    assert agent.ask("skill request", forced_skill=agent.skills[0] if forced else None) == "skill request done"
+    answer = agent.ask("skill request", forced_skill=agent.skills[0] if forced else None)
+    assert answer.startswith("Incomplete:") and "delegate" in answer
     events = [item for item in agent.session["history"] if item["role"] == "tool"]
     assert events[-1]["content"] == "error: delegate is unavailable while skills are active"
     assert "delegate tool is unavailable while skills are active" in agent.model_client.prompts[-1]
@@ -1006,7 +1011,9 @@ def test_child_inherits_skills_without_touching_parent_usage(tmp_path, capsys):
     agent = build_agent(
         tmp_path,
         [
+            '{"skills":[]}',
             '<tool>{"name":"delegate","args":{"task":"look","max_steps":2}}</tool>',
+            '{"skills":[]}',
             read_call("skills/a/SKILL.md"),
             "<final>child done</final>",
             "<final>parent done</final>",
@@ -1016,9 +1023,386 @@ def test_child_inherits_skills_without_touching_parent_usage(tmp_path, capsys):
 
     agent.ask("delegate it")
 
-    assert "Available skills:\n- a:" in agent.model_client.prompts[1]
+    assert "Available skills:\n- a:" in agent.model_client.prompts[3]
     assert agent.session["skills_used"] == []
     assert capsys.readouterr().err == ""
+
+
+def test_implicit_selection_loads_multiple_skills_before_work_and_persists_usage(tmp_path):
+    write_skill(tmp_path, "a", description="Alpha tasks", body="PRIVATE-A\n")
+    write_skill(tmp_path, "b", description="Beta tasks", body="PRIVATE-B\n")
+    agent = build_agent(tmp_path, ['{"skills":["a","b"]}', "<final>done</final>"], skill_max_chars=8)
+    agent.record({"role": "user", "content": "Earlier request", "created_at": "1"})
+
+    assert agent.ask("Follow up") == "done"
+
+    selector, task_prompt = agent.model_client.prompts
+    assert "Earlier request" in selector and "Follow up" in selector
+    assert "Alpha tasks" in selector and "Beta tasks" in selector
+    assert "PRIVATE-A" not in selector and "PRIVATE-B" not in selector
+    assert "### a\nPRIVATE-" in task_prompt and "[skill truncated at 8 chars]" in task_prompt
+    assert "### b\nPRIVATE-" in task_prompt
+    assert {entry["name"] for entry in agent.session["skills_used"]} == {"a", "b"}
+    saved = agent.session_path.read_text(encoding="utf-8")
+    assert {entry["name"] for entry in json.loads(saved)["skills_used"]} == {"a", "b"}
+    assert "PRIVATE-A" not in saved and "PRIVATE-B" not in saved
+    assert agent.active_skills == {}
+
+
+def test_implicit_selection_repeats_for_followup_and_may_select_nothing(tmp_path):
+    write_skill(tmp_path, "a", body="BODY-A\n")
+    agent = build_agent(tmp_path, [
+        '{"skills":["a"]}', "<final>first</final>",
+        '{"skills":[]}', "<final>second</final>",
+    ])
+
+    assert agent.ask("Train it") == "first"
+    assert agent.ask("Explain it instead") == "second"
+    assert "Train it" in agent.model_client.prompts[2]
+    assert "BODY-A" not in agent.model_client.prompts[2]
+    assert "Active skills:" not in agent.model_client.prompts[3]
+
+
+def test_selection_is_skipped_for_forced_and_empty_catalog(tmp_path):
+    agent = build_agent(tmp_path, ["<final>no skills</final>"])
+    assert agent.ask("hello") == "no skills"
+    assert len(agent.model_client.prompts) == 1
+
+    write_skill(tmp_path, "a", body="FORCED\n")
+    agent = build_agent(tmp_path, ["<final>forced</final>"])
+    assert agent.ask("hello", forced_skill=agent.skills[0]) == "forced"
+    assert len(agent.model_client.prompts) == 1
+    assert "FORCED" in agent.model_client.prompts[0]
+
+
+@pytest.mark.parametrize("invalid", [
+    "not json", "[]", '{"skills":"a"}', '{"skills":["unknown"]}',
+    '{"skills":["a","a"]}', '{"skills":[1]}',
+])
+def test_invalid_selection_retries_and_fails_without_executing(tmp_path, invalid):
+    write_skill(tmp_path, "a")
+    agent = build_agent(tmp_path, [invalid] * 3 + ["<final>must not run</final>"])
+
+    assert "skill selection failed" in agent.ask("work").lower()
+    assert len(agent.model_client.prompts) == 3
+    assert agent.active_skills == {} and agent.session["skills_used"] == []
+    assert not any(item["role"] == "tool" for item in agent.session["history"])
+
+
+def test_selection_retry_can_recover_and_model_failure_is_explicit(tmp_path):
+    write_skill(tmp_path, "a", body="BODY\n")
+    agent = build_agent(tmp_path, ["invalid", '{"skills":["a"]}', "<final>ok</final>"])
+    assert agent.ask("work") == "ok"
+    assert len(agent.model_client.prompts) == 3
+    assert "BODY" in agent.model_client.prompts[2]
+
+    agent.model_client = BoomClient()
+    assert "skill selection failed" in agent.ask("another").lower()
+    assert agent.active_skills == {}
+
+
+@pytest.mark.parametrize("damage", ["deleted", "invalid", "unreadable", "changed-name", "changed-description"])
+def test_selection_loading_failure_is_atomic(tmp_path, damage):
+    write_skill(tmp_path, "a")
+    path = write_skill(tmp_path, "b")
+    agent = build_agent(tmp_path, ['{"skills":["a","b"]}', "<final>must not run</final>"])
+    if damage == "deleted":
+        path.unlink()
+    elif damage == "invalid":
+        path.write_text("invalid", encoding="utf-8")
+    elif damage == "unreadable":
+        path.write_bytes(b"\xff")
+    elif damage == "changed-description":
+        write_skill(tmp_path, "b", description="changed")
+    else:
+        write_skill(tmp_path, "b", name="changed")
+
+    assert "skill loading failed" in agent.ask("work").lower()
+    assert len(agent.model_client.prompts) == 1
+    assert agent.session["skills_used"] == [] and agent.active_skills == {}
+    assert "skills_used" in json.loads(agent.session_path.read_text(encoding="utf-8"))
+    assert json.loads(agent.session_path.read_text(encoding="utf-8"))["skills_used"] == []
+
+
+def test_unknown_skill_tool_recovery_is_free_but_other_calls_are_not(tmp_path):
+    write_skill(tmp_path, "a")
+    agent = build_agent(tmp_path, [
+        '{"skills":[]}',
+        '<tool>{"name":"a","args":{}}</tool>',
+        '<tool>{"name":"list_files","args":{"path":"."}}</tool>',
+        "<final>done</final>",
+    ], max_steps=1)
+
+    assert agent.ask("work") == "done"
+    events = [item for item in agent.session["history"] if item["role"] == "tool"]
+    assert [item["name"] for item in events] == ["a", "list_files"]
+    assert "skill" in events[0]["content"] and "skills/a/SKILL.md" in events[0]["content"]
+    assert '"name": "read_file"' in events[0]["content"]
+    assert agent.session["skills_used"] == []
+    assert agent.run_tool("A", {}) == "error: unknown tool 'A'"
+
+
+def test_ordinary_unknown_tool_still_consumes_a_step(tmp_path):
+    write_skill(tmp_path, "a")
+    agent = build_agent(tmp_path, [
+        '{"skills":[]}',
+        '<tool>{"name":"missing","args":{}}</tool>',
+        "<final>stopped</final>",
+    ], max_steps=1)
+
+    assert agent.ask("work").startswith("Incomplete:")
+    assert "Final-answer turn: tool-call step limit reached" in agent.model_client.prompts[-1]
+
+
+def test_repeated_unknown_skill_calls_are_bounded_and_registered_tools_win(tmp_path):
+    write_skill(tmp_path, "search")
+    write_skill(tmp_path, "a")
+    calls = ['<tool>{"name":"a","args":{}}</tool>'] * 5
+    agent = build_agent(tmp_path, ['{"skills":[]}'] + calls + ["<final>stopped</final>"], max_steps=1)
+
+    assert "no progress" in agent.ask("work")
+    assert len(agent.model_client.prompts) == 5
+    assert "no progress" in agent.model_client.prompts[-1]
+    assert "demo" in agent.run_tool("search", {"pattern": "demo", "path": "README.md"})
+
+
+def test_implicit_parent_skill_blocks_delegation_and_preserves_approval(tmp_path):
+    write_skill(tmp_path, "a", body="BODY\n")
+    agent = build_agent(tmp_path, [
+        '{"skills":["a"]}',
+        '<tool>{"name":"delegate","args":{"task":"investigate"}}</tool>',
+        '<tool>{"name":"run_shell","args":{"command":"echo not-run"}}</tool>',
+        "<final>blocked</final>",
+    ], approval_policy="never", max_steps=3)
+
+    assert agent.ask("work").startswith("Incomplete:")
+    events = [item["content"] for item in agent.session["history"] if item["role"] == "tool"]
+    assert "delegate is unavailable" in events[0]
+    assert "approval denied" in events[1]
+    assert len(list((tmp_path / ".mini-coding-agent" / "sessions").glob("*.json"))) == 1
+
+
+def test_child_selection_remains_read_only_and_does_not_activate_parent(tmp_path):
+    write_skill(tmp_path, "a", body="CHILD-BODY\n")
+    agent = build_agent(tmp_path, [
+        '{"skills":[]}',
+        '<tool>{"name":"delegate","args":{"task":"investigate","max_steps":2}}</tool>',
+        '{"skills":["a"]}',
+        '<tool>{"name":"run_shell","args":{"command":"echo not-run"}}</tool>',
+        "<final>denied</final>",
+        "<final>parent done</final>",
+    ])
+
+    assert agent.ask("delegate investigation") == "parent done"
+    assert agent.session["skills_used"] == []
+    child_sessions = [json.loads(p.read_text(encoding="utf-8")) for p in
+                      (tmp_path / ".mini-coding-agent" / "sessions").glob("*.json")
+                      if p != agent.session_path]
+    assert len(child_sessions) == 1
+    assert child_sessions[0]["skills_used"][0]["name"] == "a"
+    assert any("approval denied" in item["content"] for item in child_sessions[0]["history"]
+               if item["role"] == "tool")
+
+
+def test_request_progress_reports_observed_outcomes_and_clears_after_request(tmp_path):
+    write_skill(tmp_path, "a", body="PRIVATE-BODY\n")
+    agent = build_agent(tmp_path, [
+        read_call("README.md"),
+        '<tool>{"name":"run_shell","args":{"command":"echo not-run"}}</tool>',
+        "<final>Done.</final>",
+    ], approval_policy="never")
+
+    answer = agent.ask("work", forced_skill=agent.skills[0])
+
+    prompt = agent.model_client.prompts[-1]
+    assert "Request progress" in prompt
+    assert "read_file: succeeded" in prompt and "run_shell: denied" in prompt
+    assert "result_id:" in prompt
+    assert answer.startswith("Incomplete:") and "denied" in answer.lower()
+    assert "PRIVATE-BODY" not in json.dumps(agent.session)
+    assert "Request progress" not in agent.prompt("next")
+
+
+@pytest.mark.parametrize("exit_code", [0, 3])
+def test_progress_distinguishes_shell_exit_status(tmp_path, exit_code):
+    write_skill(tmp_path, "a")
+    agent = build_agent(tmp_path, [
+        '<tool>{"name":"run_shell","args":{"command":"test-command"}}</tool>',
+        "<final>answer</final>",
+    ])
+    with patch("mini_coding_agent.subprocess.run", return_value=subprocess.CompletedProcess(
+        ["test-command"], exit_code, stdout="output", stderr=""
+    )):
+        agent.ask("work", forced_skill=agent.skills[0])
+    expected = "succeeded" if exit_code == 0 else "failed"
+    assert f"run_shell: {expected}" in agent.model_client.prompts[-1]
+
+
+def test_active_skill_read_is_free_and_model_can_continue(tmp_path):
+    write_skill(tmp_path, "a", body="BODY\n")
+    agent = build_agent(tmp_path, [
+        read_call("skills/a/SKILL.md"),
+        read_call("README.md"),
+        "<final>result</final>",
+    ], max_steps=1)
+
+    agent.ask("work", forced_skill=agent.skills[0])
+
+    events = [item for item in agent.session["history"] if item["role"] == "tool"]
+    assert len(events) == 2
+    assert "already loaded" in events[0]["content"].lower()
+    assert "# README.md" in events[1]["content"]
+    assert "Final-answer turn" in agent.model_client.prompts[-1]
+
+
+def test_explicit_request_can_inspect_active_skill_file(tmp_path):
+    write_skill(tmp_path, "a", body="BODY\n")
+    agent = build_agent(tmp_path, [read_call("skills/a/SKILL.md"), "<final>summary</final>"])
+
+    assert agent.ask("summarize skills/a/SKILL.md", forced_skill=agent.skills[0]) == "summary"
+    event = next(item for item in agent.session["history"] if item["role"] == "tool")
+    assert event["content"].startswith("[skill loaded:")
+    assert "BODY" in agent.model_client.prompts[-1]
+
+
+def test_repeated_active_skill_reads_stop_with_incomplete_result(tmp_path):
+    write_skill(tmp_path, "a")
+    agent = build_agent(tmp_path, [read_call("skills/a/SKILL.md")] * 8 + ["<final>Done.</final>"], max_steps=2)
+
+    answer = agent.ask("work", forced_skill=agent.skills[0])
+
+    assert answer.startswith("Incomplete:") and "no progress" in answer.lower()
+    assert len(agent.model_client.prompts) <= 5
+    assert not any(item["role"] == "tool" and item["name"] != "read_file"
+                   for item in agent.session["history"])
+
+
+def test_active_prompt_prioritizes_request_and_hides_unavailable_delegate(tmp_path):
+    write_skill(tmp_path, "a")
+    agent = build_agent(tmp_path, [])
+    agent.active_skills["a"] = "BODY"
+    agent.record({"role": "user", "content": "previous request", "created_at": "1"})
+
+    prompt = agent.prompt("current request")
+
+    assert "- delegate(" not in prompt
+    assert prompt.index("Current user request:") < prompt.index("Active skills:") < prompt.index("Transcript:")
+    assert prompt.endswith("Current user request:\ncurrent request")
+    assert "<final>Done.</final>" not in prompt
+    agent.active_skills = {}
+    assert "- delegate(" in agent.prompt("next")
+
+
+def test_history_preserves_different_line_ranges_for_same_file(tmp_path):
+    agent = build_agent(tmp_path, [])
+    for start in (1, 100):
+        agent.record({"role": "tool", "name": "read_file",
+                      "args": {"path": "file.py", "start": start, "end": start + 10},
+                      "content": f"distinct-start={start};", "created_at": "1"})
+    for i in range(7):
+        agent.record({"role": "assistant", "content": f"message {i}", "created_at": "2"})
+
+    history = agent.history_text()
+    assert "distinct-start=1;" in history and "distinct-start=100;" in history
+
+
+def test_tool_free_explanation_is_allowed_with_active_skill(tmp_path):
+    write_skill(tmp_path, "a")
+    agent = build_agent(tmp_path, ["<final>A dictionary maps keys to values.</final>"])
+
+    assert agent.ask("Explain dictionaries", forced_skill=agent.skills[0]) == "A dictionary maps keys to values."
+
+
+def test_bare_done_after_redundant_skill_read_is_not_reported_as_success(tmp_path):
+    write_skill(tmp_path, "a")
+    agent = build_agent(tmp_path, [read_call("skills/a/SKILL.md"), "<final>Done.</final>"])
+
+    answer = agent.ask("do the work", forced_skill=agent.skills[0])
+
+    assert answer.startswith("Incomplete:")
+    assert "no execution or modification" in answer
+
+
+def test_failed_action_followed_by_success_does_not_taint_next_request(tmp_path):
+    write_skill(tmp_path, "a")
+    agent = build_agent(tmp_path, [
+        read_call("missing.txt"), read_call("README.md"), "<final>Explained.</final>",
+        '{"skills":[]}', "<final>Next answer.</final>",
+    ])
+
+    assert agent.ask("first", forced_skill=agent.skills[0]) == "Explained."
+    assert "read_file: failed" in agent.model_client.prompts[2]
+    assert "read_file: succeeded" in agent.model_client.prompts[2]
+    assert agent.ask("second") == "Next answer."
+    assert "Request progress" not in agent.model_client.prompts[-1]
+
+
+def test_shell_timeout_is_reported_as_failed(tmp_path):
+    write_skill(tmp_path, "a")
+    agent = build_agent(tmp_path, [
+        '<tool>{"name":"run_shell","args":{"command":"slow"}}</tool>', "<final>Done.</final>",
+    ])
+    with patch("mini_coding_agent.subprocess.run", side_effect=subprocess.TimeoutExpired("slow", 20)):
+        answer = agent.ask("work", forced_skill=agent.skills[0])
+
+    assert answer.startswith("Incomplete:")
+    assert "run_shell: failed" in agent.model_client.prompts[-1]
+    assert "timed out" in next(item["content"] for item in agent.session["history"] if item["role"] == "tool")
+
+
+def test_denied_execution_remains_unresolved_after_successful_read(tmp_path):
+    write_skill(tmp_path, "a")
+    agent = build_agent(tmp_path, [
+        '<tool>{"name":"run_shell","args":{"command":"test-command"}}</tool>',
+        read_call("README.md"),
+        "<final>Here is the invented result.</final>",
+    ], approval_policy="never")
+
+    answer = agent.ask("work", forced_skill=agent.skills[0])
+
+    assert answer.startswith("Incomplete:") and "run_shell" in answer and "denied" in answer
+    assert "invented result" not in answer
+    assert "unresolved" in agent.model_client.prompts[-1]
+
+
+def test_successful_retry_resolves_same_execution_failure(tmp_path):
+    write_skill(tmp_path, "a")
+    agent = build_agent(tmp_path, [
+        '<tool>{"name":"run_shell","args":{"command":"test-command"}}</tool>',
+        '<tool>{"name":"run_shell","args":{"command":"test-command","timeout":30}}</tool>',
+        "<final>Done.</final>",
+    ])
+    results = [
+        subprocess.CompletedProcess(["test-command"], 1, stdout="", stderr="failed"),
+        subprocess.CompletedProcess(["test-command"], 0, stdout="ok", stderr=""),
+    ]
+    with patch("mini_coding_agent.subprocess.run", side_effect=results):
+        assert agent.ask("work", forced_skill=agent.skills[0]) == "Done."
+    assert "unresolved" not in agent.model_client.prompts[-1]
+
+
+def test_attempt_limit_reports_incomplete_after_varied_redundant_reads(tmp_path):
+    write_skill(tmp_path, "a")
+    calls = [
+        f'<tool>{{"name":"read_file","args":{{"path":"skills/a/SKILL.md","start":{i}}}}}</tool>'
+        for i in range(1, 6)
+    ]
+    agent = build_agent(tmp_path, calls + ["<final>All finished.</final>"], max_steps=1)
+
+    answer = agent.ask("work", forced_skill=agent.skills[0])
+
+    assert answer.startswith("Incomplete:") and "attempt limit" in answer
+
+
+def test_repeated_tool_guard_does_not_carry_over_between_requests(tmp_path):
+    agent = build_agent(tmp_path, [])
+    for role, name in (("user", ""), ("tool", "list_files"), ("tool", "list_files"), ("user", "")):
+        if role == "user":
+            agent.record({"role": "user", "content": "request", "created_at": "1"})
+        else:
+            agent.record({"role": role, "name": name, "args": {}, "content": "result", "created_at": "1"})
+
+    assert "README.md" in agent.run_tool("list_files", {})
 
 
 @pytest.mark.parametrize("size", [15999, 16000, 16001])
@@ -1104,7 +1488,7 @@ def test_large_tool_error_is_bounded_and_recorded(tmp_path):
         raise ValueError("e" * 17000)
 
     agent.tools["list_files"]["run"] = fail
-    assert agent.ask("work") == "done"
+    assert agent.ask("work").startswith("Incomplete:")
     event = next(item for item in agent.session["history"] if item["role"] == "tool")
     assert event["retained_length"] == 16000
     assert event["original_length"] > 16000
@@ -1143,7 +1527,7 @@ def test_retrieval_rejects_invalid_ranges(tmp_path, start, end):
 
 def test_retrieval_chunk_fits_next_prompt_and_skill_body_is_not_saved(tmp_path):
     write_skill(tmp_path, "a", body="PRIVATE-SKILL-BODY\n")
-    agent = build_agent(tmp_path, [read_call("skills/a/SKILL.md"), "<final>ok</final>"])
+    agent = build_agent(tmp_path, ['{"skills":[]}', read_call("skills/a/SKILL.md"), "<final>ok</final>"])
     assert agent.ask("work") == "ok"
     event = next(item for item in agent.session["history"] if item["role"] == "tool")
     result = agent.run_tool("read_tool_output", {"id": event["result_id"], "start": 0, "end": len(event["content"])})
@@ -1163,18 +1547,19 @@ def test_final_turn_after_tool_limit_cannot_execute_tools(tmp_path, forced):
         '<tool>{"name":"list_files","args":{"path":"missing"}}</tool>',
         '<tool>{"name":"write_file","args":{"path":"danger.txt","content":"bad"}}</tool>',
     ]
-    agent = build_agent(tmp_path, outputs, max_steps=1)
+    agent = build_agent(tmp_path, outputs if forced else ['{"skills":[]}'] + outputs, max_steps=1)
     answer = agent.ask("work", forced_skill=agent.skills[0] if forced else None)
     assert "final" in answer.lower() and "tool" in answer.lower()
     assert not (tmp_path / "danger.txt").exists()
-    assert len(agent.model_client.prompts) == 2
-    assert ("Active skills:" in agent.model_client.prompts[1]) == forced
+    assert len(agent.model_client.prompts) == (2 if forced else 3)
+    assert ("Active skills:" in agent.model_client.prompts[-1]) == forced
     assert agent.active_skills == {}
 
 
 def test_final_turn_after_malformed_response_limit(tmp_path):
     agent = build_agent(tmp_path, ["<tool>bad</tool>"] * 5 + ["<final>partial</final>"], max_steps=1)
-    assert agent.ask("work") == "partial"
+    answer = agent.ask("work")
+    assert answer.startswith("Incomplete:") and "partial" in answer
     assert len(agent.model_client.prompts) == 6
 
 

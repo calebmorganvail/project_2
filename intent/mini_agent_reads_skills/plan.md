@@ -3,7 +3,9 @@ Source: [spec.md](./spec.md) (requirement IDs `REQ-n` refer to it). Intent: [int
 
 All source changes are in `mini_coding_agent.py` (class `MiniAgent` and `main`). All tests go in `tests/test_mini_coding_agent.py` using `FakeModelClient` and the existing `build_agent(tmp_path, outputs, **kwargs)` helper. No new dependencies (REQ-30). Search by symbol rather than relying on the historical line numbers below.
 
-**Scope update:** Steps 1-9 describe the original skill implementation and are retained for traceability, not as instructions to redo completed work. Steps 10-14 extend the agent for all requests, including those without skills. Where the original steps or tests conflict with the new spec, the new steps and revised compatibility requirements take precedence (REQ-12, 28, 29, 036-045). Existing user changes must be preserved.
+**Scope update:** Steps 1-9 describe the original skill implementation and are retained for traceability, not as instructions to redo completed work. Steps 10-14 describe the agent-wide output work. Step 15 covers the new implicit selection and recovery requirements and takes precedence wherever earlier steps or tests conflict with it (REQ-046-053). Existing user changes must be preserved.
+
+**REQ-052 clarification:** The user confirmed that selection runs for ordinary requests with discovered skills, but is skipped for an empty skill catalog and explicitly forced skills, as in REQ-049. This clarifies REQ-052's "every query" wording. Selection incurs no tool steps, although the separate model call necessarily incurs inference time and compute. An unregistered tool call whose name matches a skill also consumes no tool step; all other tool calls retain existing accounting. Slash commands that do not submit a query remain unchanged.
 
 ## Decisions made while planning (confirmed with the team)
 | Topic | Decision |
@@ -30,6 +32,8 @@ All source changes are in `mini_coding_agent.py` (class `MiniAgent` and `main`).
 8. **Result identity and privacy.** Retrieval must not rerun tools or expose another session's data, and it must work for old sessions without new IDs. `/reset` must not let a stale ID resolve to a different result. Shell output may contain secrets or terminal control sequences; display is opt-in and should be safe for the terminal.
 9. **Failures and finalization.** Tool errors, repeated rejected calls, malformed model responses, and a model-service failure must not cause unbounded retries or bypass permissions. An unavailable model can prevent an answer: attempt finalization at most once and return the actual failure rather than guaranteeing a model response.
 10. **Resource limits.** A per-result retention cap does not bound total session size, repeated JSON rewrites, or `subprocess.run(capture_output=True)` memory use. Do not claim otherwise; note these as future resource-management work.
+11. **Selection is not execution.** A valid selection must be loaded in the agent handling the request before its normal loop; a read-only child's selection does not activate the parent. Selection and recovery never grant permissions or bypass active-skill delegation restrictions. A separate model call improves control over loading but cannot guarantee semantic selection accuracy.
+12. **No-step recovery must stay bounded.** Matching an unknown tool name to a skill does not consume a tool step, but repeated recovery responses and malformed selector outputs must still be bounded by explicit attempt limits.
 
 ## Implementation steps
 For new work, add focused failing tests first. Run `python -m pytest -q` in `project_2` after each new step marked **[run suite]**. Update tests only where the revised spec intentionally changes behavior (REQ-28).
@@ -172,6 +176,18 @@ Requirements: REQ-28-30, 036-045.
 - [ ] T026 Reconcile the outdated no-skill and step-loop guidance in `CLAUDE.md` with the revised spec before implementation; do not edit `intent.md` or unrelated plans.
 - [ ] T027 Run the full agent suite and manually exercise the Lab 4 skill with an available local model, display enabled and approval set to `ask`. Check the grid is visible in the prompt/result and shown in the CLI; treat model compliance as a separate observation.
 
+### Step 15. Implicit selection and skill-name recovery [run suite]
+Requirements: REQ-9-16, 17, 22-23, 27-30, 32-35, 046-053. This step modifies `mini_coding_agent.py`, `tests/test_mini_coding_agent.py`, and directly related `README.md` guidance; do not modify `intent.md`.
+
+- [ ] T028 [Plan:15.1] In `MiniAgent.ask`, run a separate selection pass for every ordinary request with discovered skills, before `_ask_loop` and any delegation, including ordinary child queries. Skip the pass for explicitly forced skills and empty catalogs. Slash commands that do not call `ask` remain unchanged. Supply the current request, a bounded selection of recent user messages for follow-up context, and discovered names and descriptions; do not supply skill bodies or unrelated tool output. Ask for `{"skills": ["name"]}`, allowing an empty list and multiple names. Do not change the stable task prefix or add dependencies.
+- [ ] T029 [Plan:15.2] Parse the selection result as a JSON object with a `skills` list of unique discovered names; reject malformed JSON, wrong shapes, duplicate or unknown names before loading any selection. Permit at most three selection attempts total; if all fail or the model call errors, return an explicit failure without entering the normal loop or treating the failure as an empty selection. A valid empty list is not an error.
+- [ ] T030 [Plan:15.3] Resolve selected names to their discovered paths, read and validate the files afresh, and stage all bodies before activating any; explicitly report a missing, unreadable, invalid, or mismatched skill file without continuing the task or recording partial activation. Activate each selected skill in the current agent using `activate_skill` and the existing cap, request and usage recording. Preserve explicit forced-skill activation without an implicit selection pass. Ensure successful usage is persisted without storing bodies in history or memory. Preserve `try/finally` cleanup on success, selector errors, file errors, interruption, and final-answer turns.
+- [ ] T031 [Plan:15.4] In `run_tool`, check the registered tool table first. For an unregistered name exactly matching a discovered skill, return a clear skill-not-tool error with a valid `read_file` example using its exact discovered relative path; do not activate the skill from the mistaken call. Keep the existing unknown-tool error for other names and registered-tool behavior and approvals unchanged.
+- [ ] T032 [Plan:15.5] Update `_ask_loop` accounting so selection attempts and matching unknown-skill-name calls consume no tool steps; ordinary unknown tools and registered calls retain their current accounting. Keep matching recovery calls subject to the existing bounded response-attempt limit, so repeated mistakes end with an explicit bounded final-answer path rather than an infinite loop. Preserve the final-only turn's ban on tool execution.
+- [ ] T033 [Plan:15.6] Add focused `FakeModelClient` tests in `tests/test_mini_coding_agent.py` for the selection contract, all query types, early activation and usage persistence, request cleanup, failure paths, exact-match recovery, registered-name collisions, step accounting and repeated-recovery limits. Update existing scripted outputs only where the new selection call intentionally changes behavior; retain approval, read-only child, session, and no-skill regression coverage.
+- [ ] T034 [Plan:15.7] Update the skills section in `README.md` to describe the separate selection pass, forced-skill behavior, unknown-name guidance, permissions, per-request lifecycle, and model inference overhead. Explain that selection is probabilistic and activation alone does not establish task completion.
+- [ ] T035 [Plan:15.8] Run the agent test suite and evaluate the target local model separately on labeled matching, no-match, multiple-skill, ambiguous and follow-up prompts. Record selected names, expected names, misses and false activations separately from end-to-end execution outcomes; use approval `ask` for any actual shell commands. Report unavailable models or blocked commands rather than claiming success.
+
 ## Tests
 Write each test once, in `tests/test_mini_coding_agent.py`. Use a small helper that writes `skills/<folder>/SKILL.md` under `tmp_path` from `name`, `description`, `body`. Use `capsys` for warnings (stderr).
 
@@ -250,27 +266,77 @@ Write each test once, in `tests/test_mini_coding_agent.py`. Use a small helper t
 - Return a tool request, empty output, or malformed output on the final turn; assert no requested tool runs, no extra retry occurs, and the user receives an explicit failure. Test a dangerous shell/write request to verify approvals and safety are not bypassed (REQ-042-044).
 - Confirm skill bodies remain active in the final prompt but are absent from stored history and memory, then are cleared after both successful and failed finalization. Ordinary final answers before the limit must not trigger an extra model call (REQ-27, 33, 044).
 
-**Manual evaluation (not automatable, C6)**: with a real Ollama model, run prompts such as "train the vacuum robot and report results" and confirm the model reads `train-and-report` itself, follows it, and that `/skill train-and-report <prompt>` forces it. Try a 4B model to see whether the truncation notice or the tier values need tuning (C2).
+**Implicit selection and recovery (step 15)**
+- Check selector input includes current request, bounded recent user context and catalog names/descriptions, but no skill bodies. Test an appropriate match, a valid empty result, multiple selections, and a follow-up (REQ-046, 048).
+- Confirm selection happens for ordinary parent and child requests with discovered skills, but not for forced skills or an empty catalog, and consumes no tool steps; non-query slash commands stay unchanged. Forced skills still activate. A selected skill appears in the parent prompt before its first normal model turn and prevents delegation under existing active-skill rules. A child remains read-only, and its own selection does not modify the parent (REQ-048, 049, 051, 052).
+- Reject malformed JSON, incorrect shapes, duplicate names and unknown names within three attempts. Test a valid retry, exhausted retries, and a model error; no normal task call or partial activation occurs on failure. Test deleted, unreadable, invalid and changed-identity skill files, including one failure among multiple selections (REQ-047-048).
+- Test correct truncation, multiple active skills, persisted `skills_used`, no skill bodies in history/memory/session JSON, and cleanup after successful and failed requests. Verify later requests run a new selection, rather than inheriting active state (REQ-048, 051).
+- Test exact discovered-name recovery including its path, case mismatch, unrelated unknown names, and a name colliding with a registered tool. Recovery must not load a skill or use a tool step; a subsequent actual read uses normal tool accounting. Repeated recovery must terminate under the response-attempt bound, while ordinary unknown calls retain their existing accounting (REQ-050, 052).
+- Run existing approval and child read-only tests with selector responses, including denied shell and write requests; selector output must not authorize any tool. Confirm all existing no-skill behavior remains intact, including no extra model call (REQ-29, 049-052).
+
+**Manual evaluation (C6)**: with an available target Ollama model, use a labeled set of paraphrased matches, unrelated requests, multiple matches, ambiguous prompts and follow-ups. Record misses and false activations separately from workflow completion. For the Lab 4 example, inspect selection and activation, then check whether approved tests and training actually ran and whether the report is supported by their outputs. Also try a 4B model to assess truncation (C2).
 
 ## Requirement mapping
 
-| Requirements | Plan coverage |
-|---|---|
-| REQ-1-4 | Step 1 discovery and step 8 reset |
-| REQ-5, 5a, 6, 6a, 7, 8 | Step 1 parsing and validation |
-| REQ-9-12, 35 | Step 4 skill prompt; step 11 agent-wide prompt |
-| REQ-13-16, 31 | Steps 2 and 5 skill loading and caps; step 10 preserves the cap |
-| REQ-17-21 | Step 7 forced skill and CLI |
-| REQ-22-27 | Steps 3, 5-8, and 10-13 session and lifecycle |
-| REQ-28-30 | Steps 10-14 compatibility and verification |
-| REQ-32-34 | Steps 6, 7, and 13 lifecycle |
-| REQ-036 | Step 10 bounded retention (T010-T011) |
-| REQ-037-038 | Step 11 transcript budget and visibility (T015-T017) |
-| REQ-039-040 | Steps 10-11 retrieval, IDs, resume, and notices (T012-T016) |
-| REQ-041 | Step 12 opt-in command display (T018-T020) |
-| REQ-042-043 | Step 13 final-only turn and failure reporting (T021-T023) |
-| REQ-044 | Steps 10-13 no-skill, permission, and body-privacy compatibility |
-| REQ-045 | Step 14 documentation (T025) |
+Paths below are relative to the repository root. Earlier steps describe the existing implementation; step 15 references its new plan items and tasks.
+
+| REQ ID | Description | Plan items | Implementation evidence |
+|---|---|---|---|
+| REQ-1 | Discover skills | Step 1 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-2 | Direct subfolders only | Step 1 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-3 | No discovery warning for no skills | Step 1 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-4 | Rescan on reset | Steps 1, 8 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-5 | Parse required frontmatter | Step 1 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-5a | Unsupported YAML values | Step 1 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-6 | Warn on invalid metadata | Step 1 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-6a | Validate skill names | Step 1 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-7 | Handle duplicate names | Step 1 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-8 | Handle unreadable files | Step 1 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-9 | List available skills | Steps 4, 15.1 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-10 | On-demand loading guidance, as superseded | Steps 4, 15.1, 15.3 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-11 | Exclude unloaded bodies | Steps 4, 15.1 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-12 | No skill sections for empty catalog | Steps 4, 11, 15.6 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-13 | Activate recognized skill reads | Steps 5, 15.4 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-14 | Multiple active skills | Steps 5, 15.2, 15.3 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-15 | Other skill files do not activate | Step 5 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-16 | Cap skill bodies | Steps 2, 5, 10, 15.3 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-17 | Forced skill | Steps 7, 15.3 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-18 | Missing forced prompt usage | Step 7 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-19 | Unknown forced skill error | Step 7 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-20 | Preserve built-in commands | Steps 7, 15.1 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-21 | Skill CLI and help | Step 7 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-22 | Persist usage, not active state | Steps 3, 15.3 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-23 | Show skill memory | Steps 4, 15.6 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-24 | Reset usage | Step 8 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-25 | Support old sessions | Steps 3, 10 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-26 | Warn for removed skills | Step 3 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-27 | Reload for later requests, as superseded | Steps 6, 15.1, 15.3 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-28 | Unchanged behavior tests | Steps 10-14, 15.6 | `tests/test_mini_coding_agent.py` |
+| REQ-29 | Permissions and compatibility | Steps 10-14, 15.4-15.6 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-30 | No new required dependencies | Steps 8, 15.1 | `mini_coding_agent.py`, `pyproject.toml` |
+| REQ-31 | Model-specific skill caps | Steps 2, 8, 15.3 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-32 | Request-scoped active state | Steps 6, 15.3 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-33 | Clear state on exit | Steps 6, 13, 15.3 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-34 | Initial active state, as superseded | Steps 6, 15.1, 15.3 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-35 | Stable skill catalog | Step 4 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-036 | Retain bounded output | Step 10 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-037 | Recent transcript budget | Step 11 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-038 | Explicit truncation | Step 11 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-039 | Retrieve retained results | Steps 10-11 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-040 | Retrieval errors and old sessions | Steps 10-11 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-041 | Optional command display | Step 12 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-042 | Final-only turn | Step 13 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-043 | Explicit finalization failure | Step 13 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-044 | Output compatibility and privacy | Steps 10-13 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-045 | Output documentation | Step 14 | `README.md` |
+| REQ-046 | Select skills before execution | Plan 15.1, 15.6 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-047 | Validate selection and bound retries | Plan 15.2, 15.6 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-048 | Load selections in the parent | Plan 15.3, 15.6 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-049 | Skip selection for empty catalog and forced skill | Plan 15.1-15.3, 15.6 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-050 | Recover unknown skill-name calls | Plan 15.4-15.6 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-051 | Preserve permissions and lifecycle | Plan 15.3-15.6 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-052 | Selection frequency and tool budget | Plan 15.1, 15.5-15.6 | `mini_coding_agent.py`, `tests/test_mini_coding_agent.py` |
+| REQ-053 | Focused tests and real-model evaluation | Plan 15.6, 15.8 | `tests/test_mini_coding_agent.py`, evaluation results |
 
 ## Done criteria
 - Every testable behavior requirement has at least one passing test; verify documentation by inspection and selection quality manually (C6).
@@ -279,4 +345,7 @@ Write each test once, in `tests/test_mini_coding_agent.py`. Use a small helper t
 - With command display enabled, executed command results and failures are visible in captured CLI output. The disabled default does not display them.
 - Tool-limit and malformed-response exhaustion lead to one final-only attempt; no tool is executed during it, and a model-service failure is reported explicitly.
 - Loading or forcing a skill does not persist its body in `history`, `memory`, or the saved session JSON.
+- Every ordinary request with discovered skills receives the separate selection pass; forced skills and empty catalogs skip it. Selection and exact skill-name recovery consume no tool steps and remain bounded; forced skills still activate.
+- Valid selected skills are active in the parent before its first normal model turn; failed selection or loading is explicit, and permissions and request cleanup remain intact.
+- Focused selector and recovery tests pass; report real-model selection accuracy and end-to-end execution separately, or explicitly note when evaluation is unavailable.
 - `intent.md` is unchanged.
