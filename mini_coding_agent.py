@@ -88,6 +88,14 @@ def middle(text, limit):
 
 
 SKILL_NAME_RE = re.compile(r"^[a-z0-9-]+$")
+SKILL_MATCH_THRESHOLD = 0.25
+SKILL_LOG_NAME = "skills.jsonl"
+DEFAULT_NUM_CTX = 8192
+SKILL_STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "can", "do", "does", "for", "from",
+    "how", "i", "in", "into", "is", "it", "its", "me", "my", "of", "on", "or", "please",
+    "so", "that", "the", "then", "this", "to", "up", "us", "we", "what", "with", "you", "your",
+}
 SKILL_SIZE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*b\b", re.IGNORECASE)
 
 
@@ -158,6 +166,33 @@ def discover_skills(root):
         seen.add(skill["name"])
         skills.append(skill)
     return skills, warnings
+
+
+def skill_tokens(text):
+    """Lower-case words/numbers without stopwords, lightly stemmed; 'lab4' -> 'lab', '4'."""
+    tokens = []
+    for word in re.findall(r"[a-z]+|\d+", str(text).lower()):
+        if word in SKILL_STOPWORDS:
+            continue
+        for suffix in ("ing", "ed", "es", "s"):
+            if word.endswith(suffix) and len(word) - len(suffix) >= 3:
+                word = word[: -len(suffix)]
+                break
+        tokens.append(word)
+    return tokens
+
+
+def skill_similarity(text_a, text_b):
+    """Cosine similarity (0-1) of the word-count vectors of two texts."""
+    a, b = {}, {}
+    for counts, text in ((a, text_a), (b, text_b)):
+        for token in skill_tokens(text):
+            counts[token] = counts.get(token, 0) + 1
+    if not a or not b:
+        return 0.0
+    dot = sum(count * b.get(token, 0) for token, count in a.items())
+    norm = (sum(c * c for c in a.values()) ** 0.5) * (sum(c * c for c in b.values()) ** 0.5)
+    return round(dot / norm, 3)
 
 
 def skill_cap_for_model(model_name, override=None):
@@ -290,8 +325,9 @@ class FakeModelClient:
 
 
 class OllamaModelClient:
-    def __init__(self, model, host, temperature, top_p, timeout):
+    def __init__(self, model, host, temperature, top_p, timeout, num_ctx=DEFAULT_NUM_CTX):
         self.model = model
+        self.num_ctx = num_ctx
         self.host = host.rstrip("/")
         self.temperature = temperature
         self.top_p = top_p
@@ -305,6 +341,7 @@ class OllamaModelClient:
             "raw": False,
             "think": False,
             "options": {
+                "num_ctx": self.num_ctx,
                 "num_predict": max_new_tokens,
                 "temperature": self.temperature,
                 "top_p": self.top_p,
@@ -358,6 +395,8 @@ class MiniAgent:
         skill_max_chars=None,
         model_name=None,
         show_command_output=False,
+        skill_threshold=SKILL_MATCH_THRESHOLD,
+        skill_log_echo=False,
     ):
         self.model_client = model_client
         self.workspace = workspace
@@ -378,6 +417,10 @@ class MiniAgent:
                 print(warning, file=sys.stderr)
         self.skills = skills
         self.active_skills = {}
+        self.skill_triggers = {}
+        self.skill_threshold = skill_threshold
+        self.skill_log_echo = skill_log_echo
+        self.skill_log_path = self.root / ".mini-coding-agent" / SKILL_LOG_NAME
         self.current_request = ""
         self.request_progress = None
         self._skill_read = None
@@ -681,16 +724,24 @@ class MiniAgent:
             memory["task"] = clip(user_message.strip(), 300)
         self.record({"role": "user", "content": user_message, "created_at": now()})
 
+        final = None
         try:
             if forced_skill is not None:
-                self.activate_skill(forced_skill, forced_skill["body"])
+                self.match_skill(user_message, forced_skill)
+                self.activate_skill(forced_skill, forced_skill["body"], "explicit")
             elif self.skills:
-                phase = "selection"
+                matched = self.match_skill(user_message)
+                phase = "loading" if matched is not None else "selection"
                 try:
-                    selected = self.select_skills(user_message)
+                    if matched is not None:
+                        picks, trigger = [matched[0]], "similarity"
+                    else:
+                        picks, trigger = self.select_skills(user_message), "model-select"
+                        self.log_skill_event("model_select", prompt=user_message,
+                                             selected=[skill["name"] for skill in picks])
                     phase = "loading"
                     staged = []
-                    for skill in selected:
+                    for skill in picks:
                         path = self.path(skill["rel"])
                         if path != skill["path"]:
                             raise ValueError(f"{skill['name']}: skill path changed")
@@ -700,17 +751,79 @@ class MiniAgent:
                         staged.append((skill, loaded["body"]))
                 except (RuntimeError, ValueError, OSError) as exc:
                     final = f"skill {phase} failed: {exc}"
+                    if phase == "selection":
+                        self.log_skill_event("model_select", prompt=user_message, selected=None, error=str(exc))
                     self.record({"role": "assistant", "content": final, "created_at": now()})
                     self.remember(memory["notes"], clip(final, 220), 5)
                     return final
                 for skill, body in staged:
-                    self.activate_skill(skill, body)
+                    self.activate_skill(skill, body, trigger)
                 self.session_path = self.session_store.save(self.session)
-            return self._ask_loop(user_message)
+            final = self._ask_loop(user_message)
+            return final
         finally:
+            for name in self.active_skills:
+                self.log_skill_event(
+                    "finished", skill=name, trigger=self.skill_triggers.get(name),
+                    answer=clip(final if final is not None else "request ended with an error", 500),
+                )
             self.active_skills = {}
+            self.skill_triggers = {}
             self.request_progress = None
             self.current_request = ""
+
+    ###############################################
+    #### 7) Skill Selection And Logging ##########
+    ###############################################
+    def match_skill(self, user_message, forced_skill=None):
+        """Similarity check: score the prompt against every skill and log the decision.
+
+        Returns (skill, trigger) or None. A forced skill (/skill) always wins;
+        otherwise the best skill at or above the threshold is selected. When
+        nothing is selected, ask() falls back to the model selection pass.
+        """
+        if not self.skills or self.depth > 0:
+            return None
+        scores = {
+            s["name"]: skill_similarity(user_message, f"{s['name'].replace('-', ' ')} {s['description']}")
+            for s in self.skills
+        }
+        selected = None
+        if forced_skill is not None:
+            selected = (forced_skill, "explicit")
+        elif self.skill_threshold is not None and scores:
+            best = max(scores, key=scores.get)
+            if scores[best] >= self.skill_threshold:
+                selected = (next(s for s in self.skills if s["name"] == best), "similarity")
+        self.log_skill_event(
+            "match", prompt=user_message, scores=scores, threshold=self.skill_threshold,
+            selected=selected[0]["name"] if selected else None, trigger=selected[1] if selected else None,
+        )
+        return selected
+
+    def log_skill_event(self, event, **fields):
+        entry = {"time": now(), "event": event, "session": self.session["id"], **fields}
+        try:
+            self.skill_log_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.skill_log_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except OSError as exc:
+            print(f"warning: could not write skill log: {exc}", file=sys.stderr)
+        if self.skill_log_echo:
+            if event == "match":
+                ranked = ", ".join(f"{k}={v:.2f}" for k, v in sorted(entry["scores"].items(), key=lambda kv: -kv[1]))
+                fallback = "no match; model selection next" if entry["trigger"] is None else entry["trigger"]
+                text = (f"prompt={clip(entry['prompt'], 60)!r} scores[{ranked}] threshold={entry['threshold']} "
+                        f"-> {entry['selected'] or 'none'} ({fallback})")
+            elif event == "model_select":
+                picked = ", ".join(entry["selected"] or []) or "none"
+                text = f"model selection -> {picked}" + (f" (error: {entry['error']})" if entry.get("error") else "")
+            elif event == "executed":
+                text = f"executing skill '{entry['skill']}' (trigger={entry['trigger']})"
+            else:
+                text = f"skill '{entry['skill']}' finished"
+            print(f"[skills] {text}", file=sys.stderr)
+        return entry
 
     def select_skills(self, user_message):
         recent = [item["content"] for item in self.session["history"][:-1] if item["role"] == "user"][-3:]
@@ -733,7 +846,12 @@ class MiniAgent:
                 prompt + (f"\nInvalid selection: {error}" if error else ""), self.max_new_tokens
             )
             try:
-                result = json.loads(raw)
+                text = str(raw).strip()
+                if text.startswith("```"):
+                    text = text.strip("`").strip()
+                    if text.lower().startswith("json"):
+                        text = text[4:].strip()
+                result = json.loads(text)
             except (TypeError, json.JSONDecodeError):
                 error = "expected a JSON object"
                 continue
@@ -750,15 +868,21 @@ class MiniAgent:
             return [known[name] for name in names]
         raise ValueError(error)
 
-    def activate_skill(self, skill, body):
+    def activate_skill(self, skill, body, trigger="model"):
         capped = truncate_skill(body, self.skill_cap)
+        if skill["name"] not in self.active_skills:
+            self.skill_triggers[skill["name"]] = trigger
+            self.log_skill_event("executed", skill=skill["name"], trigger=trigger, path=skill["rel"],
+                                 chars=len(capped))
         self.active_skills[skill["name"]] = capped
         request = clip(self.current_request, 300)
         for entry in self.session["skills_used"]:
             if isinstance(entry, dict) and entry.get("name") == skill["name"] and entry.get("request") == request:
                 break
         else:
-            self.session["skills_used"].append({"name": skill["name"], "request": request, "at": now()})
+            self.session["skills_used"].append(
+                {"name": skill["name"], "request": request, "at": now(), "trigger": self.skill_triggers.get(skill["name"])}
+            )
         return capped
 
     def skill_for_path(self, resolved):
@@ -1456,6 +1580,7 @@ def build_agent(args):
         temperature=args.temperature,
         top_p=args.top_p,
         timeout=args.ollama_timeout,
+        num_ctx=args.num_ctx,
     )
     session_id = args.resume
     if session_id == "latest":
@@ -1472,6 +1597,8 @@ def build_agent(args):
             model_name=args.model,
             skill_max_chars=args.skill_max_chars,
             show_command_output=args.show_command_output,
+            skill_threshold=args.skill_threshold,
+            skill_log_echo=True,
         )
     return MiniAgent(
         model_client=model,
@@ -1483,6 +1610,8 @@ def build_agent(args):
         model_name=args.model,
         skill_max_chars=args.skill_max_chars,
         show_command_output=args.show_command_output,
+        skill_threshold=args.skill_threshold,
+        skill_log_echo=True,
     )
 
 
@@ -1515,6 +1644,8 @@ def build_arg_parser():
     parser.add_argument("--show-command-output", action="store_true", help="Display executed command output; may reveal sensitive data.")
     parser.add_argument("--temperature", type=float, default=0.2, help="Sampling temperature sent to Ollama.")
     parser.add_argument("--top-p", type=float, default=0.9, help="Top-p sampling value sent to Ollama.")
+    parser.add_argument("--num-ctx", type=positive_int, default=DEFAULT_NUM_CTX, help="Ollama context window in tokens; prompts longer than this are silently cut by Ollama.")
+    parser.add_argument("--skill-threshold", type=float, default=SKILL_MATCH_THRESHOLD, help="Minimum prompt/skill similarity (0-1) to load a skill automatically.")
     parser.add_argument(
         "--skill-max-chars",
         type=positive_int,
