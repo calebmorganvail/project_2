@@ -2,6 +2,11 @@
 
 Adds an agent skills component to [rasbt/mini-coding-agent](https://github.com/rasbt/mini-coding-agent) and uses it to solve Lab 4 (vacuum robot Q-learning).
 
+
+## TLDR: Project Results
+We successfully implemented a feature allowing the mini coding agent to read and utilize skills in its decision-making process. The skills are either called implicitly via a cosine similarity calculation with the user prompt and skill description, or explicitly with the /skill <skill-name> <prompt> format. The mini coding agent was able to use our existing train-and-report skill to run our implementaion of Q-learning from lab 5 and report the learned grid and hyperparameters back.
+
+The mini coding agent does not currently have enough context or computational ability to implement Q-learning on its own. Additionally, our skill train-and-report from Lab 5 was intended for use verifying an existing implementation of Q-learning and the training loop, not implementing one from scratch. Our solution from lab 5 took advantage of increased context with /context files explaining what Q-learning should do and with provided hyperparameters, along with sub-agents to test the generated code. We even used a specialized sub-agent specifically for helping implement Q-learning. Given that the mini-coding agent is not able to take advantage of resources like these due to its small size and long runtime on local devices, it was unable to reliably generate a new solution to lab 5 and use the train-and-report skill to verify. Train-and-report can still be run by the mini coding agent on the current implementation, which is what was generated for lab 5 previously.
 ## Structure
 ```
 mini_coding_agent.py                agent + skills component (from rasbt/mini-coding-agent, extended)
